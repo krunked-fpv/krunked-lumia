@@ -41,9 +41,12 @@ import { SaveManager, type RunRecordOutcome, type SettingsUpdatePatch } from './
 
 export interface CustomPackCallbacks {
   isCustomPackAvailable?: () => boolean;
+  getCustomPackStatusLabel?: () => string;
+  getCustomPalettes?: () => readonly Palette[];
+  onApplyPackMode?: (mode: PackMode) => Promise<boolean>;
+  /** Alias for onApplyPackMode retained for backward compatibility. */
   onSetPackMode?: (mode: PackMode) => Promise<boolean>;
   onRequestLoadCustomPack?: () => void;
-  getCustomPackStatusLabel?: () => string;
 }
 
 const MAX_FRAME_DELTA_MS = 100;
@@ -75,6 +78,8 @@ export class GameApp {
   private selectedTrack: TrackId;
 
   private customPackCallbacks: CustomPackCallbacks = {};
+  /** Active palette ID when a Custom Pack palette (not stored in SaveManager) is selected. */
+  private activePackPaletteId: string | null = null;
 
   // Loop & frame-pacing state
   private running = false;
@@ -170,6 +175,39 @@ export class GameApp {
       onSelectProfile: (profileId) => {
         this.saveManager.selectProfile(profileId);
       },
+      onCreateProfile: (name) => this.saveManager.createProfile(name),
+      onRenameProfile: (profileId, newName) => this.saveManager.renameProfile(profileId, newName),
+      onDeleteProfile: (profileId) => this.saveManager.deleteProfile(profileId),
+      onSaveCustomPalette: (input) => this.saveManager.saveCustomPalette(input),
+      onDeleteCustomPalette: (paletteId) => {
+        if (this.activePackPaletteId === paletteId) {
+          this.activePackPaletteId = null;
+        }
+        return this.saveManager.deleteCustomPalette(paletteId);
+      },
+      onApplyPalette: (paletteId) => {
+        this.applySettingsPatch({ paletteId });
+      },
+      onCopyToClipboard: async (text) => {
+        try {
+          if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+            await navigator.clipboard.writeText(text);
+            return true;
+          }
+        } catch {
+          // Ignore clipboard permission errors cleanly
+        }
+        return false;
+      },
+      onRequestImportCode: () => {
+        if (typeof window !== 'undefined' && typeof window.prompt === 'function') {
+          return window.prompt('Paste 36-hex palette share code (optional Name:hex):', '');
+        }
+        return null;
+      },
+      onApplyControlBindings: ({ keyboard, gamepad }) => {
+        this.applySettingsPatch({ keyboard, gamepad });
+      },
       onPlayMenuMove: () => this.audioEngine.menu.playMove(),
       onPlayMenuSelect: () => {
         this.audioEngine.menu.playSelect();
@@ -246,23 +284,71 @@ export class GameApp {
         delete window.__KRUNKED_DEBUG__;
       }
     }
+    this.menuScreens.dispose();
     this.debugDrawer.dispose();
     this.inputManager.dispose();
     this.audioEngine.dispose();
     this.renderer.dispose();
   }
 
+  showToast(text: string, durationSec = 2.5): void {
+    this.menuScreens.showToast(text, durationSec);
+  }
+
   // ==========================================================================
   // SCREEN & GAME LIFECYCLE
   // ==========================================================================
 
+  private getEffectivePalettes(): Palette[] {
+    const base = this.saveManager.getAllPalettes();
+    if (this.saveManager.getSettings().packMode !== 'custom') {
+      return base;
+    }
+    const packPalettes = this.customPackCallbacks.getCustomPalettes?.() ?? [];
+    if (packPalettes.length === 0) {
+      return base;
+    }
+    const seen = new Set<string>(base.map((p) => p.id));
+    const merged: Palette[] = [...base];
+    for (let i = 0; i < packPalettes.length; i++) {
+      const pal = packPalettes[i];
+      if (!seen.has(pal.id)) {
+        seen.add(pal.id);
+        merged.push(pal);
+      }
+    }
+    return merged;
+  }
+
   private getActivePalette(): Palette {
     const settings = this.saveManager.getSettings();
-    return getPaletteById(settings.paletteId, this.saveManager.getAllPalettes());
+    const allPalettes = this.getEffectivePalettes();
+    if (settings.packMode === 'custom' && this.activePackPaletteId) {
+      const packPal = allPalettes.find((p) => p.id === this.activePackPaletteId);
+      if (packPal) {
+        return packPal;
+      }
+    }
+    return getPaletteById(settings.paletteId, allPalettes);
   }
 
   private applySettingsPatch(patch: SettingsUpdatePatch): void {
-    const updated = this.saveManager.updateSettings(patch);
+    let effectivePatch: SettingsUpdatePatch = patch;
+    if (patch.paletteId !== undefined) {
+      const saveHasPalette = this.saveManager.getAllPalettes().some((p) => p.id === patch.paletteId);
+      if (saveHasPalette) {
+        this.activePackPaletteId = null;
+      } else {
+        const packHasPalette = this.getEffectivePalettes().some((p) => p.id === patch.paletteId);
+        if (packHasPalette) {
+          this.activePackPaletteId = patch.paletteId;
+          const { paletteId: _ignored, ...rest } = patch;
+          effectivePatch = rest;
+        }
+      }
+    }
+
+    const updated = this.saveManager.updateSettings(effectivePatch);
     this.audioEngine.setMasterVolume(updated.audio.masterVolume);
     this.audioEngine.setMuted(updated.audio.muted);
     if (this.simState && patch.gameplay?.tutorialEnabled !== undefined) {
@@ -280,7 +366,7 @@ export class GameApp {
     }
 
     this.screen = next;
-    this.inputManager.clearEdges();
+    this.inputManager.cancelCapture();
     this.menuScreens.onEnterScreen(next, this.buildMenuContext());
 
     // Keep music clean across screen transitions
@@ -337,23 +423,46 @@ export class GameApp {
     }
   }
 
-  private async setPackMode(mode: PackMode): Promise<boolean> {
-    if (this.customPackCallbacks.onSetPackMode) {
-      const ok = await this.customPackCallbacks.onSetPackMode(mode);
+  async setPackMode(mode: PackMode, options?: { silent?: boolean }): Promise<boolean> {
+    const applyPack =
+      this.customPackCallbacks.onApplyPackMode ?? this.customPackCallbacks.onSetPackMode;
+    if (applyPack) {
+      const ok = await applyPack(mode);
       if (ok) {
+        if (mode === 'builtin') {
+          this.activePackPaletteId = null;
+        }
         this.saveManager.updateSettings({ packMode: mode });
+        if (!options?.silent) {
+          this.menuScreens.showToast(
+            mode === 'custom' ? 'CUSTOM PACK ACTIVE' : 'BUILT-IN ART ACTIVE',
+            2.5,
+          );
+        }
+      } else if (!options?.silent) {
+        this.menuScreens.showToast(
+          mode === 'custom' ? 'NO CUSTOM PACK LOADED' : 'PACK SWITCH FAILED',
+          2.5,
+        );
       }
       return ok;
     }
 
     if (mode === 'builtin') {
+      this.activePackPaletteId = null;
       this.renderer.resetBuiltinAtlas();
       this.renderer.resetBuiltinCovers();
       this.audioEngine.setPackMode('builtin');
       this.saveManager.updateSettings({ packMode: 'builtin' });
+      if (!options?.silent) {
+        this.menuScreens.showToast('BUILT-IN ART ACTIVE', 2.5);
+      }
       return true;
     }
 
+    if (!options?.silent) {
+      this.menuScreens.showToast('NO CUSTOM PACK LOADED', 2.5);
+    }
     return false;
   }
 
@@ -477,7 +586,7 @@ export class GameApp {
       const uiInput = this.inputManager.pollUiInput(settings);
       const ctx = this.buildMenuContext();
       this.anyKeyLatched = false;
-      this.menuScreens.update(dtSec, uiInput, ctx, this.menuCallbacks);
+      this.menuScreens.update(dtSec, uiInput, ctx, this.menuCallbacks, this.inputManager);
 
       if (this.screen === 'ENDGAME') {
         this.renderer.effects.update(rawDtMs / SIM_DT_MS);
@@ -540,8 +649,8 @@ export class GameApp {
 
   private buildMenuContext(): MenuScreenContext {
     const settings = this.saveManager.getSettings();
-    const allPalettes = this.saveManager.getAllPalettes();
-    const palette = getPaletteById(settings.paletteId, allPalettes);
+    const allPalettes = this.getEffectivePalettes();
+    const palette = this.getActivePalette();
     const customAvailable = this.customPackCallbacks.isCustomPackAvailable?.() ?? false;
     const statusLabel =
       this.customPackCallbacks.getCustomPackStatusLabel?.() ??
@@ -583,11 +692,28 @@ export class GameApp {
   private readonly handleAudioUnlockGesture = (): void => {
     if (this.audioUnlocked) return;
     this.audioUnlocked = true;
-    void this.audioEngine.unlock().then(() => {
+    void (async () => {
+      await this.audioEngine.unlock();
+      // If Custom Pack mode was activated before AudioContext existed, re-decode audio buffers now
+      const applyPack =
+        this.customPackCallbacks.onApplyPackMode ?? this.customPackCallbacks.onSetPackMode;
+      if (
+        applyPack &&
+        this.saveManager.getSettings().packMode === 'custom' &&
+        this.customPackCallbacks.isCustomPackAvailable?.()
+      ) {
+        try {
+          await applyPack('custom');
+        } catch {
+          // Stay cleanly with procedural fallback if custom audio decode fails
+        }
+      }
+
       const onMenuScreen =
         this.screen === 'TITLE' ||
         this.screen === 'MODE_SELECT' ||
         this.screen === 'SETTINGS' ||
+        this.screen === 'COLOR_EDITOR' ||
         this.screen === 'SCORES_STATS' ||
         this.screen === 'CREDITS' ||
         this.screen === 'PROFILES';
@@ -597,7 +723,7 @@ export class GameApp {
         }
         this.audioEngine.startMenuMusic();
       }
-    });
+    })();
   };
 
   private readonly handleGlobalKeyDown = (e: KeyboardEvent): void => {
@@ -672,7 +798,7 @@ export class GameApp {
       },
 
       setPalette: (paletteIdOrName: string) => {
-        const all = this.saveManager.getAllPalettes();
+        const all = this.getEffectivePalettes();
         const needle = paletteIdOrName.trim().toLowerCase();
         const found =
           all.find((p) => p.id.toLowerCase() === needle) ??
@@ -805,6 +931,7 @@ export class GameApp {
 
       resetSave: () => {
         const fresh = this.saveManager.reset();
+        this.activePackPaletteId = null;
         this.audioEngine.setMasterVolume(fresh.settings.audio.masterVolume);
         this.audioEngine.setMuted(fresh.settings.audio.muted);
         this.selectedMode = fresh.lastMode;

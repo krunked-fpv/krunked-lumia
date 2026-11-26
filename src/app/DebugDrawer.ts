@@ -3,6 +3,7 @@ import {
   TARGET_FPS_OPTIONS,
   type DebugBridge,
   type GameModeId,
+  type PackMode,
   type SongSection,
   type TargetFps,
 } from '../contracts/index.js';
@@ -18,6 +19,7 @@ export class DebugDrawer {
   private readonly bridge: DebugBridge;
   private root: HTMLDivElement | null = null;
   private telemetryEl: HTMLPreElement | null = null;
+  private packToggleBtn: HTMLButtonElement | null = null;
   private open = false;
   private lastRefreshMs = 0;
 
@@ -86,6 +88,11 @@ export class DebugDrawer {
       `FLAGS:    tate=${s.settings.render.tateRotate ? 'ON' : 'OFF'} zoom=${s.settings.render.boardZoom ? 'ON' : 'OFF'} soundtest=${s.settings.gameplay.soundtestEnabled ? 'ON' : 'OFF'} imp=${s.profile.impossibleUnlocked ? 'UNLOCKED' : 'LOCKED'}`,
     ];
     this.telemetryEl.textContent = lines.join('\n');
+
+    if (this.packToggleBtn) {
+      this.packToggleBtn.textContent =
+        s.packMode === 'custom' ? 'TOGGLE PACK: USE BUILTIN' : 'TOGGLE PACK: USE CUSTOM';
+    }
   }
 
   dispose(): void {
@@ -94,6 +101,7 @@ export class DebugDrawer {
     }
     this.root = null;
     this.telemetryEl = null;
+    this.packToggleBtn = null;
   }
 
   private ensureMounted(): void {
@@ -138,6 +146,38 @@ export class DebugDrawer {
     pre.style.cssText = 'margin:0;padding:6px;background:rgba(0,0,0,0.45);border:1px solid rgba(255,255,255,0.12);white-space:pre-wrap;word-break:break-word;font-size:10px;';
     root.appendChild(pre);
     this.telemetryEl = pre;
+
+    // Pack Toggle & QA Screen Shortcuts
+    const packToggleBtn = this.makeButton('TOGGLE PACK: USE CUSTOM', () => {
+      const current = this.bridge.getState().packMode;
+      const next: PackMode = current === 'custom' ? 'builtin' : 'custom';
+      void this.bridge.setPackMode(next).then(() => {
+        this.refresh(performance.now(), true);
+      });
+    });
+    this.packToggleBtn = packToggleBtn;
+
+    root.appendChild(
+      this.makeSection('PACK & SCREENS', [
+        packToggleBtn,
+        this.makeButton('SETTINGS', () => {
+          this.bridge.setScreen('SETTINGS');
+          this.refresh(performance.now(), true);
+        }),
+        this.makeButton('COLOR EDITOR', () => {
+          this.bridge.setScreen('COLOR_EDITOR');
+          this.refresh(performance.now(), true);
+        }),
+        this.makeButton('PROFILES', () => {
+          this.bridge.setScreen('PROFILES');
+          this.refresh(performance.now(), true);
+        }),
+        this.makeButton('TITLE', () => {
+          this.bridge.setScreen('TITLE');
+          this.refresh(performance.now(), true);
+        }),
+      ]),
+    );
 
     // Start Mode buttons
     root.appendChild(
