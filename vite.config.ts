@@ -51,8 +51,11 @@ function localLumiaAssetsPlugin(): Plugin {
   };
 }
 
-export default defineConfig({
+export default defineConfig(({ command }) => ({
   base: './',
+  define: {
+    __KRUNKED_DEV_MIDDLEWARE__: command === 'serve',
+  },
   plugins: [localLumiaAssetsPlugin()],
   build: {
     outDir: 'dist',
@@ -64,4 +67,4 @@ export default defineConfig({
     port: 5173,
     host: '127.0.0.1',
   },
-});
+}));

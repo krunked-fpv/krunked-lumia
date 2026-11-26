@@ -35,6 +35,8 @@ import {
 } from './customPackLoader.js';
 import type { DecodedImage } from './qoiDecoder.js';
 
+declare const __KRUNKED_DEV_MIDDLEWARE__: boolean | undefined;
+
 const IDB_STORE_NAME = 'packs';
 const IDB_ACTIVE_KEY = 'active';
 const IDB_VERSION = 1;
@@ -368,6 +370,15 @@ export class PackManager {
   }
 
   private async probeLocalDevPack(): Promise<boolean> {
+    if (
+      this.localBaseUrl === '/__lumia_assets__' &&
+      typeof __KRUNKED_DEV_MIDDLEWARE__ !== 'undefined' &&
+      !__KRUNKED_DEV_MIDDLEWARE__
+    ) {
+      this.localManifest = null;
+      return false;
+    }
+
     if (typeof fetch !== 'function') {
       return false;
     }
