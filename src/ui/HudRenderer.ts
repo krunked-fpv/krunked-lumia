@@ -5,6 +5,7 @@ import {
   GAME_MODE_CONFIGS,
   LOGICAL_WIDTH,
   SIM_DT_MS,
+  isLightPaletteBg,
   parseHexRgb01,
   type BlockColor,
   type NextBlockLocation,
@@ -576,10 +577,11 @@ export class HudRenderer {
     const iconFrame = TUTORIAL_ICON_FRAME[step];
     renderer.drawSpriteHex('tutorial_icons', iconFrame, x + 12, y + 14, palette.colors[3], 1);
 
-    // Step title
+    // Step title (use high-contrast slot 2 ink on light palettes so yellow/orange accents stay readable)
     const title = TUTORIAL_TITLES[step];
     const titleFont = title.length > 10 ? '3x5' : '5x7';
-    renderer.drawTextHex(title, x + 24, y + 6, palette.colors[3], 1, titleFont, 'left');
+    const titleColor = isLightPaletteBg(palette.colors[0]) ? palette.colors[2] : palette.colors[3];
+    renderer.drawTextHex(title, x + 24, y + 6, titleColor, 1, titleFont, 'left');
 
     // Step counter (e.g., 1/2)
     if (progress.target > 0) {

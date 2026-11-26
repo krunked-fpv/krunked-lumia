@@ -39,6 +39,21 @@ export class DebugDrawer {
       this.refresh(performance.now(), true);
     } else if (this.root) {
       this.root.style.display = 'none';
+      this.returnFocusToGame();
+    }
+  }
+
+  private returnFocusToGame(): void {
+    if (typeof document === 'undefined') return;
+    if (document.activeElement instanceof HTMLElement) {
+      document.activeElement.blur();
+    }
+    const canvas = document.getElementById('game-canvas');
+    if (canvas instanceof HTMLElement) {
+      if (!canvas.hasAttribute('tabindex')) {
+        canvas.setAttribute('tabindex', '-1');
+      }
+      canvas.focus({ preventScroll: true });
     }
   }
 
@@ -63,7 +78,7 @@ export class DebugDrawer {
       `ENTITIES: particles=${s.entityCounts.particles}  bgGeo=${s.entityCounts.bgGeometry}  blocks=${s.entityCounts.activeBlocks}`,
       `HASH:     ${s.stateHash}`,
       sim
-        ? `SIM:      ${sim.mode} | ${sim.phase} | lv=${sim.level} | clr=${sim.cleared} | score=${sim.score} | combo=${sim.combo} | sec=${sim.songSection}`
+        ? `SIM:      ${sim.mode} | ${sim.phase} | t=${sim.tick} | lv=${sim.level} | clr=${sim.cleared} | drp=${sim.drops} | score=${sim.score} | combo=${sim.combo} | sec=${sim.songSection}`
         : `SIM:      (idle)`,
       st
         ? `AUDIO:    ${st.trackId} | ${st.loopName}->${st.nextLoopName} | ${Math.round(st.bpm)}BPM | prog=${st.progressionStep + 1}/${st.progressionLength}`
@@ -270,7 +285,9 @@ export class DebugDrawer {
     ].join(';');
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
+      btn.blur();
       onClick();
+      this.returnFocusToGame();
     });
     return btn;
   }
