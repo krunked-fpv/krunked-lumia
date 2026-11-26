@@ -10,9 +10,12 @@ import {
   parseHexRgb01,
   type AppScreen,
   type GameModeId,
+  type GamepadBindings,
+  type KeyboardBindings,
   type NextBlockLocation,
   type PackMode,
   type Palette,
+  type PaletteColors,
   type PlayerProfile,
   type SimState,
   type TargetFps,
@@ -25,17 +28,25 @@ import { isPaletteLight } from '../data/palettes.js';
 import { NEXT_BLOCK_LOCATIONS } from '../data/settingsDefaults.js';
 import { getTrackMeta, getTracksForMode } from '../data/tracks.js';
 import { isModeUnlocked } from '../sim/modes.js';
-import type { UiInputState } from '../input/InputManager.js';
+import { InputManager, type UiInputState } from '../input/InputManager.js';
 import type { RunRecordOutcome, SettingsUpdatePatch } from '../app/SaveManager.js';
 import type { WebGL2Renderer } from '../render/WebGL2Renderer.js';
+import { ColorEditorScreen, type ColorEditorCallbacks } from './ColorEditorScreen.js';
+import {
+  ControlsRemapScreen,
+  type ControlsDeviceTab,
+  type ControlsRemapCallbacks,
+} from './ControlsRemapScreen.js';
 import { formatHudTime } from './HudRenderer.js';
+import { ProfilesScreen, type ProfilesScreenCallbacks } from './ProfilesScreen.js';
 
-export type SettingsTabId = 'COLORS' | 'GAMEPLAY' | 'EFFECTS' | 'DISPLAY' | 'AUDIO';
+export type SettingsTabId = 'COLORS' | 'GAMEPLAY' | 'EFFECTS' | 'CONTROLS' | 'DISPLAY' | 'AUDIO';
 
 const SETTINGS_TABS: readonly SettingsTabId[] = [
   'COLORS',
   'GAMEPLAY',
   'EFFECTS',
+  'CONTROLS',
   'DISPLAY',
   'AUDIO',
 ] as const;
@@ -83,6 +94,15 @@ export interface MenuScreenCallbacks {
   onTogglePackMode: () => void;
   onRequestLoadCustomPack: () => void;
   onSelectProfile: (profileId: string) => void;
+  onCreateProfile: (name: string) => PlayerProfile | null;
+  onRenameProfile: (profileId: string, newName: string) => PlayerProfile | null;
+  onDeleteProfile: (profileId: string) => boolean;
+  onSaveCustomPalette: (input: { id?: string; name: string; colors: PaletteColors }) => Palette | null;
+  onDeleteCustomPalette: (paletteId: string) => boolean;
+  onApplyPalette: (paletteId: string) => void;
+  onCopyToClipboard: (text: string) => boolean | Promise<boolean>;
+  onRequestImportCode: () => string | null;
+  onApplyControlBindings: (bindings: { keyboard: KeyboardBindings; gamepad: GamepadBindings }) => void;
   onPlayMenuMove: () => void;
   onPlayMenuSelect: () => void;
   onPlayMenuBack: () => void;
@@ -147,12 +167,13 @@ interface SettingRowDef {
   desc: string;
   kind: 'toggle' | 'cycle' | 'slider' | 'action';
   sliderRatio?: number;
-  adjust: (dir: -1 | 1) => void;
+  adjust?: (dir: -1 | 1) => void;
   activate: () => void;
   setRatio?: (ratio: number) => void;
 }
 
 const BACK_BTN_RECT: HitRect = { x: 8, y: 7, w: 34, h: 11 };
+const COLORS_EDITOR_BTN_RECT: HitRect = { x: 14, y: 128, w: 292, h: 15 };
 
 const NOOP_MENU_CALLBACKS: MenuScreenCallbacks = {
   onDismissPhotosensitivity: () => {},
@@ -169,6 +190,15 @@ const NOOP_MENU_CALLBACKS: MenuScreenCallbacks = {
   onTogglePackMode: () => {},
   onRequestLoadCustomPack: () => {},
   onSelectProfile: () => {},
+  onCreateProfile: () => null,
+  onRenameProfile: () => null,
+  onDeleteProfile: () => false,
+  onSaveCustomPalette: () => null,
+  onDeleteCustomPalette: () => false,
+  onApplyPalette: () => {},
+  onCopyToClipboard: () => false,
+  onRequestImportCode: () => null,
+  onApplyControlBindings: () => {},
   onPlayMenuMove: () => {},
   onPlayMenuSelect: () => {},
   onPlayMenuBack: () => {},
@@ -182,7 +212,14 @@ const NOOP_MENU_CALLBACKS: MenuScreenCallbacks = {
 export class MenuScreens {
   private animTime = 0;
 
+  private readonly colorEditor = new ColorEditorScreen();
+  private readonly controlsRemap = new ControlsRemapScreen();
+  private readonly profilesScreen = new ProfilesScreen();
+  private fallbackInputManager: InputManager | null = null;
+
   private titleIdx = 0;
+  private titleProfileHovered = false;
+  private titlePackBadgeHovered = false;
   private modeIdx = 0;
   private trackIdx = 0;
   private pauseIdx = 0;
@@ -191,21 +228,54 @@ export class MenuScreens {
   private settingsTabIdx = 0;
   private settingsRowIdx = 0; // -1 = tab bar focused, 0..N-1 = row focused
   private settingsScrollTop = 0;
+  private controlsRemapOpen = false;
 
-  private profileIdx = 0;
   private lockShakeTimer = 0;
   private toastText = '';
   private toastTimer = 0;
 
-  showToast(text: string, durationSec = 2.0): void {
+  dispose(): void {
+    this.colorEditor.dispose();
+    this.profilesScreen.dispose();
+    this.controlsRemapOpen = false;
+    if (this.fallbackInputManager) {
+      this.fallbackInputManager.dispose();
+      this.fallbackInputManager = null;
+    }
+  }
+
+  isControlsRemapOpen(): boolean {
+    return this.controlsRemapOpen;
+  }
+
+  showToast(text: string, durationSec = 2.5): void {
     this.toastText = text;
     this.toastTimer = durationSec;
   }
 
+  private getFallbackInputManager(): InputManager {
+    if (!this.fallbackInputManager) {
+      this.fallbackInputManager = new InputManager();
+    }
+    return this.fallbackInputManager;
+  }
+
   onEnterScreen(screen: AppScreen, ctx: MenuScreenContext): void {
+    if (screen !== 'COLOR_EDITOR') {
+      this.colorEditor.dispose();
+    }
+    if (screen !== 'PROFILES') {
+      this.profilesScreen.dispose();
+    }
+    if (screen !== 'SETTINGS') {
+      this.controlsRemapOpen = false;
+    }
+
     switch (screen) {
       case 'TITLE':
         this.titleIdx = 0;
+        this.titleProfileHovered = false;
+        this.titlePackBadgeHovered = false;
         break;
       case 'MODE_SELECT': {
         const idx = GAME_MODE_ORDER.indexOf(ctx.selectedMode);
@@ -225,20 +295,28 @@ export class MenuScreens {
         this.endgameIdx = 0;
         break;
       case 'SETTINGS':
+        this.controlsRemapOpen = false;
         this.settingsRowIdx = 0;
         this.settingsScrollTop = 0;
         break;
-      case 'PROFILES': {
-        const idx = ctx.profiles.findIndex((p) => p.id === ctx.profile.id);
-        this.profileIdx = idx >= 0 ? idx : 0;
+      case 'COLOR_EDITOR':
+        this.colorEditor.onEnter(ctx.allPalettes, ctx.palette.id);
         break;
-      }
+      case 'PROFILES':
+        this.profilesScreen.onEnter(ctx.profiles, ctx.profile.id);
+        break;
       default:
         break;
     }
   }
 
-  update(dtSec: number, input: UiInputState, ctx: MenuScreenContext, cb: MenuScreenCallbacks): void {
+  update(
+    dtSec: number,
+    input: UiInputState,
+    ctx: MenuScreenContext,
+    cb: MenuScreenCallbacks,
+    inputManager?: InputManager,
+  ): void {
     this.animTime += Math.max(0, Math.min(dtSec, 0.1));
     if (this.lockShakeTimer > 0) {
       this.lockShakeTimer = Math.max(0, this.lockShakeTimer - dtSec);
@@ -267,15 +345,17 @@ export class MenuScreens {
         this.updateEndgame(input, ctx, cb);
         break;
       case 'SETTINGS':
-        this.updateSettings(input, ctx, cb);
+        this.updateSettings(dtSec, input, ctx, cb, inputManager);
         break;
       case 'SCORES_STATS':
       case 'CREDITS':
+        this.updateSimpleBackScreen(input, cb, 'TITLE');
+        break;
       case 'COLOR_EDITOR':
-        this.updateSimpleBackScreen(input, cb, ctx.screen === 'COLOR_EDITOR' ? 'SETTINGS' : 'TITLE');
+        this.colorEditor.update(dtSec, input, this.buildColorEditorCallbacks(cb));
         break;
       case 'PROFILES':
-        this.updateProfiles(input, ctx, cb);
+        this.profilesScreen.update(dtSec, input, this.buildProfilesCallbacks(cb));
         break;
       default:
         break;
@@ -312,10 +392,10 @@ export class MenuScreens {
         this.renderCredits(renderer, ctx);
         break;
       case 'COLOR_EDITOR':
-        this.renderColorEditorFallback(renderer, ctx);
+        this.colorEditor.render(renderer, ctx.palette);
         break;
       case 'PROFILES':
-        this.renderProfiles(renderer, ctx);
+        this.profilesScreen.render(renderer, ctx.palette);
         break;
       default:
         break;
@@ -323,10 +403,11 @@ export class MenuScreens {
 
     if (this.toastTimer > 0 && this.toastText) {
       const alpha = Math.min(1, this.toastTimer * 2);
-      const w = Math.min(260, this.toastText.length * 4 + 16);
+      const display = this.toastText.length > 70 ? `${this.toastText.slice(0, 67)}...` : this.toastText;
+      const w = Math.min(308, display.length * 4 + 14);
       const x = Math.round((LOGICAL_WIDTH - w) * 0.5);
-      drawBox(renderer, x, 152, w, 13, ctx.palette.colors[1], ctx.palette.colors[3], 0.95 * alpha, alpha);
-      renderer.drawTextHex(this.toastText, LOGICAL_WIDTH * 0.5, 156, ctx.palette.colors[3], alpha, '3x5', 'center');
+      drawBox(renderer, x, 150, w, 12, ctx.palette.colors[1], ctx.palette.colors[3], 0.96 * alpha, alpha);
+      renderer.drawTextHex(display, LOGICAL_WIDTH * 0.5, 154, ctx.palette.colors[3], alpha, '3x5', 'center');
     }
   }
 
@@ -445,33 +526,56 @@ export class MenuScreens {
   // 2. TITLE SCREEN
   // ==========================================================================
 
-  private getTitleItems(ctx: MenuScreenContext): { id: string; label: string }[] {
-    const items = [
-      { id: 'start', label: 'START' },
-      { id: 'settings', label: 'SETTINGS' },
-      { id: 'scores', label: 'SCORES + STATS' },
-      { id: 'credits', label: 'CREDITS' },
+  private getTitleItems(ctx: MenuScreenContext): { id: string; label: string; kind: 'main' | 'pack' }[] {
+    const items: { id: string; label: string; kind: 'main' | 'pack' }[] = [
+      { id: 'start', label: 'START', kind: 'main' },
+      { id: 'settings', label: 'SETTINGS', kind: 'main' },
+      { id: 'scores', label: 'SCORES + STATS', kind: 'main' },
+      { id: 'profiles', label: 'PROFILES', kind: 'main' },
+      { id: 'credits', label: 'CREDITS', kind: 'main' },
     ];
-    if (ctx.hasCustomPackLoader || ctx.customPackAvailable) {
+    if (ctx.customPackAvailable) {
       items.push({
-        id: 'pack',
-        label: ctx.customPackAvailable
-          ? ctx.packMode === 'custom'
-            ? 'PACK: CUSTOM'
-            : 'PACK: BUILT-IN'
-          : 'LOAD CUSTOM PACK',
+        id: 'pack_toggle',
+        label: ctx.packMode === 'custom' ? 'USE BUILT-IN ART' : 'USE CUSTOM PACK',
+        kind: 'pack',
+      });
+    }
+    if (ctx.hasCustomPackLoader) {
+      items.push({
+        id: 'pack_load',
+        label: 'LOAD CUSTOM PACK',
+        kind: 'pack',
       });
     }
     return items;
   }
 
-  private getTitleItemRect(index: number, count: number): HitRect {
-    const startY = count > 4 ? 84 : 88;
-    return { x: 96, y: startY + index * 14, w: 128, h: 12 };
+  private getTitleItemRect(
+    index: number,
+    items: readonly { id: string; label: string; kind: 'main' | 'pack' }[],
+  ): HitRect {
+    const item = items[index];
+    if (!item || item.kind === 'main') {
+      return { x: 92, y: 64 + index * 13, w: 136, h: 12 };
+    }
+    const firstPackIdx = items.findIndex((it) => it.kind === 'pack');
+    const packCount = items.length - firstPackIdx;
+    const packPos = index - firstPackIdx;
+    if (packCount >= 2) {
+      return packPos === 0
+        ? { x: 54, y: 134, w: 102, h: 13 }
+        : { x: 164, y: 134, w: 102, h: 13 };
+    }
+    return { x: 104, y: 134, w: 112, h: 13 };
+  }
+
+  private getTitleProfileBadgeRect(): HitRect {
+    return { x: 8, y: 164, w: 90, h: 11 };
   }
 
   private getTitlePackBadgeRect(): HitRect {
-    return { x: 224, y: 164, w: 88, h: 11 };
+    return { x: 220, y: 164, w: 92, h: 11 };
   }
 
   private updateTitle(input: UiInputState, ctx: MenuScreenContext, cb: MenuScreenCallbacks): void {
@@ -484,11 +588,17 @@ export class MenuScreens {
     } else if (input.down) {
       this.titleIdx = (this.titleIdx + 1) % items.length;
       cb.onPlayMenuMove();
+    } else if (input.left || input.right) {
+      const firstPackIdx = items.findIndex((it) => it.kind === 'pack');
+      if (firstPackIdx >= 0 && items.length - firstPackIdx >= 2 && this.titleIdx >= firstPackIdx) {
+        this.titleIdx = this.titleIdx === firstPackIdx ? firstPackIdx + 1 : firstPackIdx;
+        cb.onPlayMenuMove();
+      }
     }
 
     if (input.mouseInBounds) {
       for (let i = 0; i < items.length; i++) {
-        if (hitTest(input.mouseX, input.mouseY, this.getTitleItemRect(i, items.length))) {
+        if (hitTest(input.mouseX, input.mouseY, this.getTitleItemRect(i, items))) {
           if (input.mouseMoved && this.titleIdx !== i) {
             this.titleIdx = i;
             cb.onPlayMenuMove();
@@ -501,10 +611,29 @@ export class MenuScreens {
         }
       }
 
-      if (input.mouseClicked && hitTest(input.mouseX, input.mouseY, this.getTitlePackBadgeRect())) {
+      const overProfile = hitTest(input.mouseX, input.mouseY, this.getTitleProfileBadgeRect());
+      if (input.mouseMoved && overProfile !== this.titleProfileHovered) {
+        this.titleProfileHovered = overProfile;
+        if (overProfile) cb.onPlayMenuMove();
+      }
+      if (input.mouseClicked && overProfile) {
+        cb.onPlayMenuSelect();
+        cb.onNavigate('PROFILES');
+        return;
+      }
+
+      const overPackBadge = hitTest(input.mouseX, input.mouseY, this.getTitlePackBadgeRect());
+      if (input.mouseMoved && overPackBadge !== this.titlePackBadgeHovered) {
+        this.titlePackBadgeHovered = overPackBadge;
+        if (overPackBadge) cb.onPlayMenuMove();
+      }
+      if (input.mouseClicked && overPackBadge) {
         this.handlePackBadgeAction(ctx, cb);
         return;
       }
+    } else {
+      this.titleProfileHovered = false;
+      this.titlePackBadgeHovered = false;
     }
 
     if (input.confirm) {
@@ -521,7 +650,17 @@ export class MenuScreens {
       cb.onRequestLoadCustomPack();
     } else {
       cb.onPlayMenuMove();
-      this.showToast('BUILT-IN PACK ACTIVE');
+      this.showToast('BUILT-IN ART ACTIVE', 2.5);
+    }
+  }
+
+  private handlePackRowAction(ctx: MenuScreenContext, cb: MenuScreenCallbacks): void {
+    if (ctx.customPackAvailable) {
+      cb.onTogglePackMode();
+    } else if (ctx.hasCustomPackLoader) {
+      cb.onRequestLoadCustomPack();
+    } else {
+      this.showToast('BUILT-IN ART ACTIVE', 2.5);
     }
   }
 
@@ -539,12 +678,25 @@ export class MenuScreens {
         cb.onPlayMenuSelect();
         cb.onNavigate('SCORES_STATS');
         break;
+      case 'profiles':
+        cb.onPlayMenuSelect();
+        cb.onNavigate('PROFILES');
+        break;
       case 'credits':
         cb.onPlayMenuSelect();
         cb.onNavigate('CREDITS');
         break;
-      case 'pack':
-        this.handlePackBadgeAction(ctx, cb);
+      case 'pack_toggle':
+        cb.onPlayMenuSelect();
+        cb.onTogglePackMode();
+        break;
+      case 'pack_load':
+        cb.onPlayMenuSelect();
+        if (ctx.hasCustomPackLoader) {
+          cb.onRequestLoadCustomPack();
+        } else {
+          this.showToast('BUILT-IN ART ACTIVE', 2.5);
+        }
         break;
     }
   }
@@ -554,72 +706,127 @@ export class MenuScreens {
 
     // Floating decorative 4-color diamond satellites around the logo emblem
     const emblemX = 160;
-    const emblemY = 27;
+    const emblemY = 21;
     renderer.drawSpriteHex('logo_diamond_spr', 0, emblemX, emblemY, ctx.palette.colors[3], 1);
 
-    const bob = Math.sin(this.animTime * 2.2) * 2.5;
-    renderer.drawSpriteHex('block_spr', 0, emblemX - 24, emblemY - 4 + bob, ctx.palette.colors[2], 0.9);
-    renderer.drawSpriteHex('block_spr', 1, emblemX + 24, emblemY - 4 - bob, ctx.palette.colors[3], 0.9);
-    renderer.drawSpriteHex('block_spr', 2, emblemX - 34, emblemY + 6 - bob, ctx.palette.colors[4], 0.85);
-    renderer.drawSpriteHex('block_spr', 3, emblemX + 34, emblemY + 6 + bob, ctx.palette.colors[5], 0.85);
+    const bob = Math.sin(this.animTime * 2.2) * 2.2;
+    renderer.drawSpriteHex('block_spr', 0, emblemX - 24, emblemY - 3 + bob, ctx.palette.colors[2], 0.9);
+    renderer.drawSpriteHex('block_spr', 1, emblemX + 24, emblemY - 3 - bob, ctx.palette.colors[3], 0.9);
+    renderer.drawSpriteHex('block_spr', 2, emblemX - 34, emblemY + 5 - bob, ctx.palette.colors[4], 0.85);
+    renderer.drawSpriteHex('block_spr', 3, emblemX + 34, emblemY + 5 + bob, ctx.palette.colors[5], 0.85);
 
     // Iconic pixel title (2x 5x7 = razor sharp pixel art)
-    renderer.drawTextHex('KRUNKED LUMIA', 161, 47, ctx.palette.colors[1], 1, '5x7', 'center', 2);
-    renderer.drawTextHex('KRUNKED LUMIA', 160, 46, ctx.palette.colors[2], 1, '5x7', 'center', 2);
+    renderer.drawTextHex('KRUNKED LUMIA', 161, 36, ctx.palette.colors[1], 1, '5x7', 'center', 2);
+    renderer.drawTextHex('KRUNKED LUMIA', 160, 35, ctx.palette.colors[2], 1, '5x7', 'center', 2);
 
     // Tagline
     renderer.drawTextHex(
       t('app.tagline'),
       160,
-      67,
+      53,
       ctx.palette.colors[3],
       0.9,
       '3x5',
       'center',
     );
 
-    // Menu Items
+    // Menu Items + Pack Controls
     const items = this.getTitleItems(ctx);
     for (let i = 0; i < items.length; i++) {
-      const rect = this.getTitleItemRect(i, items.length);
+      const item = items[i];
+      const rect = this.getTitleItemRect(i, items);
       const selected = i === this.titleIdx;
-      if (selected) {
-        drawBox(renderer, rect.x, rect.y, rect.w, rect.h, ctx.palette.colors[1], ctx.palette.colors[3], 0.92, 1);
-        renderer.drawSpriteHex('arrow_spr', 0, rect.x + 8, rect.y + 6, ctx.palette.colors[3], 1);
-        renderer.drawSpriteHex('arrow_spr', 1, rect.x + rect.w - 8, rect.y + 6, ctx.palette.colors[3], 1);
+
+      if (item.kind === 'main') {
+        if (selected) {
+          drawBox(renderer, rect.x, rect.y, rect.w, rect.h, ctx.palette.colors[1], ctx.palette.colors[3], 0.92, 1);
+          renderer.drawSpriteHex('arrow_spr', 0, rect.x + 8, rect.y + 6, ctx.palette.colors[3], 1);
+          renderer.drawSpriteHex('arrow_spr', 1, rect.x + rect.w - 8, rect.y + 6, ctx.palette.colors[3], 1);
+        }
+        renderer.drawTextHex(
+          item.label,
+          160,
+          rect.y + 3,
+          selected ? ctx.palette.colors[3] : ctx.palette.colors[2],
+          selected ? 1 : 0.88,
+          '5x7',
+          'center',
+        );
+      } else {
+        const isActiveToggle = item.id === 'pack_toggle' && ctx.packMode === 'custom';
+        const borderHex = selected
+          ? ctx.palette.colors[3]
+          : isActiveToggle
+            ? ctx.palette.colors[4]
+            : ctx.palette.colors[2];
+        drawBox(
+          renderer,
+          rect.x,
+          rect.y,
+          rect.w,
+          rect.h,
+          ctx.palette.colors[1],
+          borderHex,
+          selected ? 0.95 : 0.72,
+          selected ? 1 : 0.65,
+        );
+        if (selected) {
+          renderer.drawSpriteHex('arrow_spr', 0, rect.x + 6, rect.y + 6, ctx.palette.colors[3], 1);
+        }
+        renderer.drawTextHex(
+          item.label,
+          rect.x + rect.w * 0.5 + (selected ? 3 : 0),
+          rect.y + 4,
+          selected ? ctx.palette.colors[3] : isActiveToggle ? ctx.palette.colors[4] : ctx.palette.colors[2],
+          1,
+          '3x5',
+          'center',
+        );
       }
-      renderer.drawTextHex(
-        items[i].label,
-        160,
-        rect.y + 3,
-        selected ? ctx.palette.colors[3] : ctx.palette.colors[2],
-        selected ? 1 : 0.88,
-        '5x7',
-        'center',
-      );
     }
 
-    // Bottom status bar: Profile (left) + Palette (center) + Pack status pill (right)
-    renderer.drawTextHex(
-      ctx.profile.name.toUpperCase(),
-      10,
-      167,
-      ctx.palette.colors[2],
-      0.7,
-      '3x5',
-      'left',
+    // Bottom status bar: Clickable Profile pill (left) + Palette (center) + Pack status pill (right)
+    const profileRect = this.getTitleProfileBadgeRect();
+    drawBox(
+      renderer,
+      profileRect.x,
+      profileRect.y,
+      profileRect.w,
+      profileRect.h,
+      ctx.palette.colors[1],
+      this.titleProfileHovered ? ctx.palette.colors[3] : ctx.palette.colors[2],
+      this.titleProfileHovered ? 0.94 : 0.82,
+      this.titleProfileHovered ? 1 : 0.65,
     );
+    const rawProf = ctx.profile.name.toUpperCase();
+    const profLabel = rawProf.length > 18 ? `${rawProf.slice(0, 17)}.` : rawProf;
     renderer.drawTextHex(
-      ctx.palette.name.toUpperCase(),
-      152,
+      profLabel,
+      profileRect.x + profileRect.w * 0.5,
+      profileRect.y + 3,
+      this.titleProfileHovered ? ctx.palette.colors[3] : ctx.palette.colors[2],
+      1,
+      '3x5',
+      'center',
+    );
+
+    const rawPal = ctx.palette.name.toUpperCase();
+    const palLabel = rawPal.length > 24 ? `${rawPal.slice(0, 23)}.` : rawPal;
+    renderer.drawTextHex(
+      palLabel,
+      159,
       167,
       ctx.palette.colors[2],
-      0.65,
+      0.72,
       '3x5',
       'center',
     );
 
     const packRect = this.getTitlePackBadgeRect();
+    const packBorder =
+      this.titlePackBadgeHovered || ctx.packMode === 'custom'
+        ? ctx.palette.colors[3]
+        : ctx.palette.colors[2];
     drawBox(
       renderer,
       packRect.x,
@@ -627,15 +834,15 @@ export class MenuScreens {
       packRect.w,
       packRect.h,
       ctx.palette.colors[1],
-      ctx.packMode === 'custom' ? ctx.palette.colors[3] : ctx.palette.colors[2],
-      0.88,
-      0.8,
+      packBorder,
+      this.titlePackBadgeHovered ? 0.95 : 0.88,
+      this.titlePackBadgeHovered || ctx.packMode === 'custom' ? 1 : 0.75,
     );
     renderer.drawTextHex(
       ctx.customPackStatusLabel,
       packRect.x + packRect.w * 0.5,
       packRect.y + 3,
-      ctx.packMode === 'custom' ? ctx.palette.colors[3] : ctx.palette.colors[2],
+      packBorder,
       1,
       '3x5',
       'center',
@@ -1401,11 +1608,17 @@ export class MenuScreens {
   }
 
   // ==========================================================================
-  // 7. TABBED PIXEL SETTINGS (COLORS, GAMEPLAY, EFFECTS, DISPLAY, AUDIO)
+  // 7. TABBED PIXEL SETTINGS (COLORS, GAMEPLAY, EFFECTS, CONTROLS, DISPLAY, AUDIO)
   // ==========================================================================
 
   private getTabRect(index: number): HitRect {
-    return { x: 10 + index * 60, y: 20, w: 58, h: 12 };
+    return { x: 8 + index * 51, y: 20, w: 49, h: 12 };
+  }
+
+  private openControlsRemap(tab: ControlsDeviceTab, ctx: MenuScreenContext): void {
+    this.controlsRemap.onEnter(ctx.settings);
+    this.controlsRemap.setActiveTab(tab);
+    this.controlsRemapOpen = true;
   }
 
   private buildSettingsRows(
@@ -1462,6 +1675,36 @@ export class MenuScreens {
             activate: () => cb.onUpdateSettings({ gameplay: { preciseTimer: !gameplay.preciseTimer } }),
           },
           {
+            id: 'tutorialEnabled',
+            label: 'TUTORIAL',
+            valueText: gameplay.tutorialEnabled ? 'ON' : 'OFF',
+            desc: t('settings.tutorialEnabled.desc'),
+            kind: 'toggle',
+            adjust: () => {
+              const next = !gameplay.tutorialEnabled;
+              cb.onUpdateSettings({ gameplay: { tutorialEnabled: next } });
+              if (next) cb.onResetTutorialCompleted();
+            },
+            activate: () => {
+              const next = !gameplay.tutorialEnabled;
+              cb.onUpdateSettings({ gameplay: { tutorialEnabled: next } });
+              if (next) cb.onResetTutorialCompleted();
+            },
+          },
+          {
+            id: 'soundtestEnabled',
+            label: 'SOUNDTEST HUD',
+            valueText: gameplay.soundtestEnabled ? 'ON' : 'OFF',
+            desc: t('settings.soundtestEnabled.desc'),
+            kind: 'toggle',
+            adjust: () => cb.onUpdateSettings({ gameplay: { soundtestEnabled: !gameplay.soundtestEnabled } }),
+            activate: () => cb.onUpdateSettings({ gameplay: { soundtestEnabled: !gameplay.soundtestEnabled } }),
+          },
+        ];
+
+      case 'CONTROLS':
+        return [
+          {
             id: 'moveSpeedIndex',
             label: 'MOVE SPEED',
             valueText: `${ARR_MOVE_SPEED_NAMES[gameplay.moveSpeedIndex].toUpperCase()} (${ARR_MOVE_SPEED_TICKS[gameplay.moveSpeedIndex]}T)`,
@@ -1513,7 +1756,7 @@ export class MenuScreens {
           },
           {
             id: 'gamepadRumble',
-            label: 'GAMEPAD RUMBLE',
+            label: 'CONTROLLER RUMBLE',
             valueText: gameplay.gamepadRumble ? 'ON' : 'OFF',
             desc: t('settings.gamepadRumble.desc'),
             kind: 'toggle',
@@ -1521,30 +1764,20 @@ export class MenuScreens {
             activate: () => cb.onUpdateSettings({ gameplay: { gamepadRumble: !gameplay.gamepadRumble } }),
           },
           {
-            id: 'tutorialEnabled',
-            label: 'TUTORIAL',
-            valueText: gameplay.tutorialEnabled ? 'ON' : 'OFF',
-            desc: t('settings.tutorialEnabled.desc'),
-            kind: 'toggle',
-            adjust: () => {
-              const next = !gameplay.tutorialEnabled;
-              cb.onUpdateSettings({ gameplay: { tutorialEnabled: next } });
-              if (next) cb.onResetTutorialCompleted();
-            },
-            activate: () => {
-              const next = !gameplay.tutorialEnabled;
-              cb.onUpdateSettings({ gameplay: { tutorialEnabled: next } });
-              if (next) cb.onResetTutorialCompleted();
-            },
+            id: 'mapKeyboard',
+            label: 'MAP KEYBOARD',
+            valueText: 'REMAP >',
+            desc: 'Customize keyboard gameplay and menu keys with live capture & conflict check.',
+            kind: 'action',
+            activate: () => this.openControlsRemap('KEYBOARD', ctx),
           },
           {
-            id: 'soundtestEnabled',
-            label: 'SOUNDTEST HUD',
-            valueText: gameplay.soundtestEnabled ? 'ON' : 'OFF',
-            desc: t('settings.soundtestEnabled.desc'),
-            kind: 'toggle',
-            adjust: () => cb.onUpdateSettings({ gameplay: { soundtestEnabled: !gameplay.soundtestEnabled } }),
-            activate: () => cb.onUpdateSettings({ gameplay: { soundtestEnabled: !gameplay.soundtestEnabled } }),
+            id: 'mapController',
+            label: 'MAP CONTROLLER',
+            valueText: 'REMAP >',
+            desc: 'Customize controller buttons with live capture & conflict check.',
+            kind: 'action',
+            activate: () => this.openControlsRemap('CONTROLLER', ctx),
           },
         ];
 
@@ -1678,8 +1911,8 @@ export class MenuScreens {
               ? 'Switch live between Built-In procedural art and your loaded Custom Pack.'
               : 'Built-In Krunked pixel-diamond art & harmonic synths active.',
             kind: 'action',
-            adjust: () => this.handlePackBadgeAction(ctx, cb),
-            activate: () => this.handlePackBadgeAction(ctx, cb),
+            adjust: () => this.handlePackRowAction(ctx, cb),
+            activate: () => this.handlePackRowAction(ctx, cb),
           },
         ];
 
@@ -1718,7 +1951,7 @@ export class MenuScreens {
             desc: 'Audition a pentatonic chime at the current master volume.',
             kind: 'action',
             adjust: () => cb.onPlayMenuSelect(),
-            activate: () => cb.onPlayMenuSelect(),
+            activate: () => {},
           },
         ];
 
@@ -1729,10 +1962,18 @@ export class MenuScreens {
   }
 
   private updateSettings(
+    dtSec: number,
     input: UiInputState,
     ctx: MenuScreenContext,
     cb: MenuScreenCallbacks,
+    inputManager?: InputManager,
   ): void {
+    if (this.controlsRemapOpen) {
+      const mgr = inputManager ?? this.getFallbackInputManager();
+      this.controlsRemap.update(dtSec, input, mgr, this.buildControlsRemapCallbacks(cb));
+      return;
+    }
+
     if (input.cancel) {
       cb.onPlayMenuBack();
       cb.onNavigate(ctx.settingsReturnScreen);
@@ -1814,11 +2055,17 @@ export class MenuScreens {
       }
       cb.onPlayMenuMove();
     } else if (input.left && this.settingsRowIdx >= 0) {
-      rows[this.settingsRowIdx].adjust(-1);
-      cb.onPlayMenuMove();
+      const row = rows[this.settingsRowIdx];
+      if (row.adjust) {
+        row.adjust(-1);
+        cb.onPlayMenuMove();
+      }
     } else if (input.right && this.settingsRowIdx >= 0) {
-      rows[this.settingsRowIdx].adjust(1);
-      cb.onPlayMenuMove();
+      const row = rows[this.settingsRowIdx];
+      if (row.adjust) {
+        row.adjust(1);
+        cb.onPlayMenuMove();
+      }
     } else if (input.confirm && this.settingsRowIdx >= 0) {
       rows[this.settingsRowIdx].activate();
       cb.onPlayMenuSelect();
@@ -1842,10 +2089,10 @@ export class MenuScreens {
               const ratio = Math.max(0, Math.min(1, (input.mouseX - 176) / 82));
               row.setRatio(ratio);
               cb.onPlayMenuMove();
-            } else if (input.mouseX >= 176 && input.mouseX < 210 && row.kind !== 'toggle') {
+            } else if (row.adjust && input.mouseX >= 176 && input.mouseX < 210 && row.kind !== 'toggle' && row.kind !== 'action') {
               row.adjust(-1);
               cb.onPlayMenuMove();
-            } else if (input.mouseX > 272 && row.kind !== 'toggle') {
+            } else if (row.adjust && input.mouseX > 272 && row.kind !== 'toggle' && row.kind !== 'action') {
               row.adjust(1);
               cb.onPlayMenuMove();
             } else {
@@ -1866,6 +2113,7 @@ export class MenuScreens {
   ): void {
     const palettes = ctx.allPalettes;
     if (palettes.length === 0) return;
+    if (this.settingsRowIdx > 1) this.settingsRowIdx = 1;
     const curIdx = Math.max(0, palettes.findIndex((p) => p.id === ctx.palette.id));
 
     const selectIdx = (nextIdx: number): void => {
@@ -1875,46 +2123,90 @@ export class MenuScreens {
     };
 
     if (input.up) {
-      this.settingsRowIdx = -1;
+      if (this.settingsRowIdx === 1) {
+        this.settingsRowIdx = 0;
+      } else {
+        this.settingsRowIdx = -1;
+      }
       cb.onPlayMenuMove();
       return;
     }
-    if (input.left) {
-      selectIdx(curIdx - 1);
+    if (input.down) {
+      if (this.settingsRowIdx === 0) {
+        this.settingsRowIdx = 1;
+        cb.onPlayMenuMove();
+      }
       return;
     }
-    if (input.right) {
-      selectIdx(curIdx + 1);
-      return;
-    }
-
-    // Mouse controls inside COLORS tab: Prev/Next arrows + 9-palette visual grid!
-    if (input.mouseInBounds && input.mouseClicked) {
-      const prevBtn: HitRect = { x: 14, y: 40, w: 20, h: 16 };
-      const nextBtn: HitRect = { x: 286, y: 40, w: 20, h: 16 };
-      if (hitTest(input.mouseX, input.mouseY, prevBtn)) {
+    if (this.settingsRowIdx === 0) {
+      if (input.left) {
         selectIdx(curIdx - 1);
         return;
       }
-      if (hitTest(input.mouseX, input.mouseY, nextBtn)) {
+      if (input.right) {
         selectIdx(curIdx + 1);
         return;
       }
+      if (input.confirm) {
+        selectIdx(curIdx + 1);
+        return;
+      }
+    } else if (this.settingsRowIdx === 1 && input.confirm) {
+      cb.onPlayMenuSelect();
+      cb.onNavigate('COLOR_EDITOR');
+      return;
+    }
 
-      // Clickable 9-item quick palette ribbon around current index (y = 114..144)
-      const stripStart = Math.max(0, Math.min(palettes.length - 9, curIdx - 4));
-      const stripCount = Math.min(9, palettes.length);
-      for (let i = 0; i < stripCount; i++) {
-        const pillRect: HitRect = { x: 14 + i * 33, y: 118, w: 30, h: 24 };
-        if (hitTest(input.mouseX, input.mouseY, pillRect)) {
-          selectIdx(stripStart + i);
+    // Mouse controls inside COLORS tab: Prev/Next arrows, 9-palette visual ribbon, OPEN COLOR EDITOR button
+    if (input.mouseInBounds) {
+      if (hitTest(input.mouseX, input.mouseY, COLORS_EDITOR_BTN_RECT)) {
+        if (input.mouseMoved && this.settingsRowIdx !== 1) {
+          this.settingsRowIdx = 1;
+          cb.onPlayMenuMove();
+        }
+        if (input.mouseClicked) {
+          this.settingsRowIdx = 1;
+          cb.onPlayMenuSelect();
+          cb.onNavigate('COLOR_EDITOR');
           return;
+        }
+      }
+
+      if (input.mouseClicked) {
+        const prevBtn: HitRect = { x: 14, y: 37, w: 20, h: 15 };
+        const nextBtn: HitRect = { x: 286, y: 37, w: 20, h: 15 };
+        if (hitTest(input.mouseX, input.mouseY, prevBtn)) {
+          this.settingsRowIdx = 0;
+          selectIdx(curIdx - 1);
+          return;
+        }
+        if (hitTest(input.mouseX, input.mouseY, nextBtn)) {
+          this.settingsRowIdx = 0;
+          selectIdx(curIdx + 1);
+          return;
+        }
+
+        // Clickable 9-item quick palette ribbon around current index (y = 102..123)
+        const stripStart = Math.max(0, Math.min(Math.max(0, palettes.length - 9), curIdx - 4));
+        const stripCount = Math.min(9, palettes.length);
+        for (let i = 0; i < stripCount; i++) {
+          const pillRect: HitRect = { x: 14 + i * 33, y: 102, w: 30, h: 21 };
+          if (hitTest(input.mouseX, input.mouseY, pillRect)) {
+            this.settingsRowIdx = 0;
+            selectIdx(stripStart + i);
+            return;
+          }
         }
       }
     }
   }
 
   private renderSettings(renderer: WebGL2Renderer, ctx: MenuScreenContext): void {
+    if (this.controlsRemapOpen) {
+      this.controlsRemap.render(renderer, ctx.palette);
+      return;
+    }
+
     this.renderAmbientMenuBg(renderer, ctx, 2);
     this.renderBackButton(renderer, ctx);
 
@@ -2053,63 +2345,70 @@ export class MenuScreens {
     const curIdx = Math.max(0, palettes.findIndex((p) => p.id === ctx.palette.id));
     const active = ctx.palette;
     const light = isPaletteLight(active);
+    const selectorFocused = this.settingsRowIdx === 0;
+    const editorBtnFocused = this.settingsRowIdx === 1;
 
-    // Palette Selector Header Bar (y = 40..56)
-    drawBox(renderer, 14, 40, 20, 16, ctx.palette.colors[1], ctx.palette.colors[3], 0.92, 1);
-    renderer.drawSpriteHex('arrow_spr', 1, 24, 48, ctx.palette.colors[3], 1);
+    // Palette Selector Header Bar (y = 37..52)
+    const selBorder = selectorFocused ? ctx.palette.colors[3] : ctx.palette.colors[2];
+    const selBorderAlpha = selectorFocused ? 1 : 0.55;
+    drawBox(renderer, 14, 37, 20, 15, ctx.palette.colors[1], selBorder, 0.92, selBorderAlpha);
+    renderer.drawSpriteHex('arrow_spr', 1, 24, 44, selBorder, 1);
 
-    drawBox(renderer, 38, 40, 244, 16, ctx.palette.colors[1], ctx.palette.colors[3], 0.94, 1);
+    drawBox(renderer, 38, 37, 244, 15, ctx.palette.colors[1], selBorder, 0.94, selBorderAlpha);
     renderer.drawTextHex(
       `${String(curIdx + 1).padStart(2, '0')}/${palettes.length}  ${active.name.toUpperCase()}`,
       160,
-      45,
-      ctx.palette.colors[3],
+      41,
+      selectorFocused ? ctx.palette.colors[3] : ctx.palette.colors[2],
       1,
       '5x7',
       'center',
     );
 
-    drawBox(renderer, 286, 40, 20, 16, ctx.palette.colors[1], ctx.palette.colors[3], 0.92, 1);
-    renderer.drawSpriteHex('arrow_spr', 0, 296, 48, ctx.palette.colors[3], 1);
+    drawBox(renderer, 286, 37, 20, 15, ctx.palette.colors[1], selBorder, 0.92, selBorderAlpha);
+    renderer.drawSpriteHex('arrow_spr', 0, 296, 44, selBorder, 1);
 
-    // Light/Dark Bloom Indicator + Live 4-block diamond preview
+    // Light/Dark Bloom Indicator + Author/Origin Tag (y = 56)
     renderer.drawTextHex(
       light ? 'LIGHT INK BLOOM' : 'DARK LUMIA BLOOM',
       16,
-      62,
+      56,
       ctx.palette.colors[2],
       0.85,
       '3x5',
       'left',
     );
+    const originText = active.isCustom
+      ? 'CUSTOM PALETTE'
+      : `BY ${(active.author ?? (active.id.startsWith('ini_') ? 'CUSTOM PACK' : 'KRUNKED')).toUpperCase()}`;
     renderer.drawTextHex(
-      active.isCustom ? 'CUSTOM PALETTE' : `BY ${(active.author ?? 'KRUNKED').toUpperCase()}`,
+      originText,
       304,
-      62,
+      56,
       ctx.palette.colors[2],
       0.75,
       '3x5',
       'right',
     );
 
-    // 6 Color Swatches with Slot Names & Hex Codes (y = 72..108)
+    // 6 Color Swatches with Slot Names & Hex Codes (y = 64..98)
     for (let s = 0; s < 6; s++) {
       const sx = 14 + s * 49;
-      const sy = 72;
+      const sy = 64;
       const sw = 46;
-      const sh = 38;
+      const sh = 34;
       drawBox(renderer, sx, sy, sw, sh, ctx.palette.colors[1], ctx.palette.colors[2], 0.7, 0.55);
       // Color chip
-      renderer.drawRectHex(sx + 3, sy + 3, sw - 6, 18, active.colors[s], 1);
+      renderer.drawRectHex(sx + 3, sy + 3, sw - 6, 14, active.colors[s], 1);
       // Mini diamond icon on block slots 2..5
       if (s >= 2) {
-        renderer.drawSpriteHex('block_spr', s - 2, sx + sw * 0.5, sy + 12, active.colors[0], 0.8);
+        renderer.drawSpriteHex('block_spr', s - 2, sx + sw * 0.5, sy + 10, active.colors[0], 0.8);
       }
-      renderer.drawTextHex(PALETTE_SLOT_NAMES[s], sx + sw * 0.5, sy + 24, ctx.palette.colors[2], 0.95, '3x5', 'center');
-      renderer.drawTextHex(active.colors[s].toUpperCase(), sx + sw * 0.5, sy + 31, ctx.palette.colors[2], 0.72, '3x5', 'center');
+      renderer.drawTextHex(PALETTE_SLOT_NAMES[s], sx + sw * 0.5, sy + 19, ctx.palette.colors[2], 0.95, '3x5', 'center');
+      renderer.drawTextHex(active.colors[s].toUpperCase(), sx + sw * 0.5, sy + 26, ctx.palette.colors[2], 0.72, '3x5', 'center');
     }
 
-    // Clickable 9-palette visual swatch strip (y = 118..142)
+    // Clickable 9-palette visual swatch strip (y = 102..123)
     const stripStart = Math.max(0, Math.min(Math.max(0, palettes.length - 9), curIdx - 4));
     const stripCount = Math.min(9, palettes.length);
     for (let i = 0; i < stripCount; i++) {
@@ -2117,13 +2416,13 @@ export class MenuScreens {
       const p = palettes[pIdx];
       const isCur = pIdx === curIdx;
       const px = 14 + i * 33;
-      const py = 118;
+      const py = 102;
       drawBox(
         renderer,
         px,
         py,
         30,
-        24,
+        21,
         p.colors[0],
         isCur ? ctx.palette.colors[3] : ctx.palette.colors[2],
         1,
@@ -2131,12 +2430,12 @@ export class MenuScreens {
       );
       // 6 mini stripes inside each preview chip
       for (let c = 0; c < 6; c++) {
-        renderer.drawRectHex(px + 3 + c * 4, py + 4, 4, 10, p.colors[c], 1);
+        renderer.drawRectHex(px + 3 + c * 4, py + 3, 4, 8, p.colors[c], 1);
       }
       renderer.drawTextHex(
         String(pIdx + 1).padStart(2, '0'),
         px + 15,
-        py + 16,
+        py + 13,
         isCur ? ctx.palette.colors[3] : p.colors[2],
         1,
         '3x5',
@@ -2144,17 +2443,57 @@ export class MenuScreens {
       );
     }
 
-    // Footer instruction bar
-    drawBox(renderer, 14, 154, 292, 20, ctx.palette.colors[1], ctx.palette.colors[2], 0.86, 0.45);
-    renderer.drawTextHex(
-      'LEFT / RIGHT OR CLICK SWATCH TO SWITCH ACROSS ALL 63 PALETTES INSTANTLY',
-      160,
-      161,
-      ctx.palette.colors[2],
-      0.92,
-      '3x5',
-      'center',
+    // Interactive OPEN COLOR EDITOR action row (y = 128..143)
+    drawBox(
+      renderer,
+      COLORS_EDITOR_BTN_RECT.x,
+      COLORS_EDITOR_BTN_RECT.y,
+      COLORS_EDITOR_BTN_RECT.w,
+      COLORS_EDITOR_BTN_RECT.h,
+      ctx.palette.colors[1],
+      editorBtnFocused ? ctx.palette.colors[3] : ctx.palette.colors[2],
+      editorBtnFocused ? 0.96 : 0.74,
+      editorBtnFocused ? 1 : 0.65,
     );
+    if (editorBtnFocused) {
+      renderer.drawSpriteHex(
+        'arrow_spr',
+        0,
+        COLORS_EDITOR_BTN_RECT.x + 7,
+        COLORS_EDITOR_BTN_RECT.y + 7,
+        ctx.palette.colors[3],
+        1,
+      );
+    }
+    renderer.drawTextHex(
+      'OPEN COLOR EDITOR',
+      COLORS_EDITOR_BTN_RECT.x + 15,
+      COLORS_EDITOR_BTN_RECT.y + 4,
+      editorBtnFocused ? ctx.palette.colors[3] : ctx.palette.colors[2],
+      1,
+      '5x7',
+      'left',
+    );
+    renderer.drawTextHex(
+      'HSV / RGB / SHARE >',
+      COLORS_EDITOR_BTN_RECT.x + COLORS_EDITOR_BTN_RECT.w - 6,
+      COLORS_EDITOR_BTN_RECT.y + 5,
+      editorBtnFocused ? ctx.palette.colors[3] : ctx.palette.colors[2],
+      editorBtnFocused ? 1 : 0.8,
+      '3x5',
+      'right',
+    );
+
+    // Footer instruction bar (y = 148..171)
+    drawBox(renderer, 14, 148, 292, 23, ctx.palette.colors[1], ctx.palette.colors[2], 0.86, 0.45);
+    const hintText = editorBtnFocused
+      ? 'ENTER / CLICK: LAUNCH INTERACTIVE HSV/RGB PALETTE EDITOR, SWAP, SHARE & IMPORT'
+      : `LEFT/RIGHT OR CLICK SWATCH TO SWITCH ALL ${palettes.length} PALETTES   DOWN: COLOR EDITOR`;
+    const hintLines = wrapText(hintText, 68);
+    renderer.drawTextHex(hintLines[0] ?? '', 160, 153, ctx.palette.colors[2], 0.92, '3x5', 'center');
+    if (hintLines[1]) {
+      renderer.drawTextHex(hintLines[1], 160, 161, ctx.palette.colors[2], 0.8, '3x5', 'center');
+    }
   }
 
   // ==========================================================================
@@ -2307,75 +2646,48 @@ export class MenuScreens {
   }
 
   // ==========================================================================
-  // 10. FALLBACK COLOR_EDITOR & PROFILES SCREENS (clean Wave 2 hooks)
+  // 10. FULL WAVE 2 SCREEN CALLBACK BRIDGES (COLOR EDITOR, CONTROLS, PROFILES)
   // ==========================================================================
 
-  private renderColorEditorFallback(renderer: WebGL2Renderer, ctx: MenuScreenContext): void {
-    this.renderAmbientMenuBg(renderer, ctx, 2);
-    this.renderBackButton(renderer, ctx);
-    renderer.drawTextHex('PALETTE INSPECTOR', 160, 9, ctx.palette.colors[3], 1, '5x7', 'center');
-    this.renderColorsTab(renderer, ctx);
+  private buildColorEditorCallbacks(cb: MenuScreenCallbacks): ColorEditorCallbacks {
+    return {
+      onSavePalette: (input) => cb.onSaveCustomPalette(input),
+      onDeletePalette: (paletteId) => cb.onDeleteCustomPalette(paletteId),
+      onApplyPalette: (paletteId) => cb.onApplyPalette(paletteId),
+      onClose: () => cb.onNavigate('SETTINGS'),
+      onPlayMenuMove: cb.onPlayMenuMove,
+      onPlayMenuSelect: cb.onPlayMenuSelect,
+      onPlayMenuBack: cb.onPlayMenuBack,
+      onPlayMenuFail: cb.onPlayMenuFail,
+      onCopyToClipboard: (text) => cb.onCopyToClipboard(text),
+      onRequestImportCode: () => cb.onRequestImportCode(),
+    };
   }
 
-  private updateProfiles(
-    input: UiInputState,
-    ctx: MenuScreenContext,
-    cb: MenuScreenCallbacks,
-  ): void {
-    if (input.cancel) {
-      cb.onPlayMenuBack();
-      cb.onNavigate('TITLE');
-      return;
-    }
-    const count = ctx.profiles.length;
-    if (count === 0) return;
-
-    if (input.up) {
-      this.profileIdx = (this.profileIdx - 1 + count) % count;
-      cb.onPlayMenuMove();
-    } else if (input.down) {
-      this.profileIdx = (this.profileIdx + 1) % count;
-      cb.onPlayMenuMove();
-    } else if (input.confirm) {
-      cb.onPlayMenuSelect();
-      cb.onSelectProfile(ctx.profiles[this.profileIdx].id);
-      cb.onNavigate('TITLE');
-    }
-
-    if (input.mouseInBounds && input.mouseClicked) {
-      if (hitTest(input.mouseX, input.mouseY, BACK_BTN_RECT)) {
-        cb.onPlayMenuBack();
-        cb.onNavigate('TITLE');
-        return;
-      }
-      for (let i = 0; i < count; i++) {
-        const rect: HitRect = { x: 64, y: 36 + i * 20, w: 192, h: 16 };
-        if (hitTest(input.mouseX, input.mouseY, rect)) {
-          this.profileIdx = i;
-          cb.onPlayMenuSelect();
-          cb.onSelectProfile(ctx.profiles[i].id);
-          cb.onNavigate('TITLE');
-          return;
-        }
-      }
-    }
+  private buildControlsRemapCallbacks(cb: MenuScreenCallbacks): ControlsRemapCallbacks {
+    return {
+      onApply: (bindings) => cb.onApplyControlBindings(bindings),
+      onClose: () => {
+        this.controlsRemapOpen = false;
+      },
+      onPlayMenuMove: cb.onPlayMenuMove,
+      onPlayMenuSelect: cb.onPlayMenuSelect,
+      onPlayMenuBack: cb.onPlayMenuBack,
+      onPlayMenuFail: cb.onPlayMenuFail,
+    };
   }
 
-  private renderProfiles(renderer: WebGL2Renderer, ctx: MenuScreenContext): void {
-    this.renderAmbientMenuBg(renderer, ctx, 2);
-    this.renderBackButton(renderer, ctx);
-    renderer.drawTextHex('PROFILES', 160, 9, ctx.palette.colors[3], 1, '5x7', 'center');
-
-    for (let i = 0; i < ctx.profiles.length; i++) {
-      const p = ctx.profiles[i];
-      const y = 36 + i * 20;
-      const selected = i === this.profileIdx;
-      const active = p.id === ctx.profile.id;
-      drawBox(renderer, 64, y, 192, 16, ctx.palette.colors[1], selected ? ctx.palette.colors[3] : ctx.palette.colors[2], 0.9, selected ? 1 : 0.45);
-      renderer.drawTextHex(p.name.toUpperCase(), 74, y + 5, selected ? ctx.palette.colors[3] : ctx.palette.colors[2], 1, '5x7', 'left');
-      if (active) {
-        renderer.drawTextHex('ACTIVE', 248, y + 6, ctx.palette.colors[3], 1, '3x5', 'right');
-      }
-    }
+  private buildProfilesCallbacks(cb: MenuScreenCallbacks): ProfilesScreenCallbacks {
+    return {
+      onSelectProfile: (profileId) => cb.onSelectProfile(profileId),
+      onCreateProfile: (name) => cb.onCreateProfile(name),
+      onRenameProfile: (profileId, newName) => cb.onRenameProfile(profileId, newName),
+      onDeleteProfile: (profileId) => cb.onDeleteProfile(profileId),
+      onClose: () => cb.onNavigate('TITLE'),
+      onPlayMenuMove: cb.onPlayMenuMove,
+      onPlayMenuSelect: cb.onPlayMenuSelect,
+      onPlayMenuBack: cb.onPlayMenuBack,
+      onPlayMenuFail: cb.onPlayMenuFail,
+    };
   }
 }
