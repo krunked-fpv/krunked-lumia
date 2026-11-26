@@ -780,7 +780,7 @@ describe('SaveManager Persistence, Unlocks, Custom Palettes & Corruption Recover
     expect(data.customPalettes[0].id).toBe('good_pal');
     expect(data.customPalettes[0].colors[2]).toBe('#ffffff');
     expect(data.settings.paletteId).toBe('pico_dark');
-    expect(data.settings.render.targetFps).toBe(60);
+    expect(data.settings.render.targetFps).toBe(120);
     expect(data.settings.render.bloomAmount).toBe(1);
     expect(data.settings.render.tateRotate).toBe(false);
     expect(data.settings.gameplay.moveSpeedIndex).toBe(5);
@@ -801,6 +801,6 @@ describe('SaveManager Persistence, Unlocks, Custom Palettes & Corruption Recover
     storage3.setItem(SAVE_STORAGE_KEY, JSON.stringify(mutated));
     const recovered3 = new SaveManager(storage3);
     expect(recovered3.wasRecoveredFromCorruption()).toBe(true);
-    expect(recovered3.getSettings().render.targetFps).toBe(60);
+    expect(recovered3.getSettings().render.targetFps).toBe(120);
   });
 });

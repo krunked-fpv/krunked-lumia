@@ -40,7 +40,7 @@ export const NEXT_BLOCK_LOCATIONS: readonly NextBlockLocation[] = [
 
 export function createDefaultRenderSettings(): RenderSettings {
   return {
-    targetFps: 60,
+    targetFps: 120,
     native60Snap: false,
     bloomAmount: 1.0,
     boardShake: true,
@@ -77,17 +77,17 @@ export function createDefaultAudioSettings(): AudioSettings {
 
 export function createDefaultKeyboardBindings(): KeyboardBindings {
   return {
-    moveLeft: ['ArrowLeft', 'KeyA'],
-    moveRight: ['ArrowRight', 'KeyD'],
-    hardDrop: ['ArrowDown', 'KeyS', 'Space'],
-    spinLeft: ['KeyZ', 'KeyQ', 'ShiftLeft'],
-    spinRight: ['KeyX', 'KeyE', 'ArrowUp', 'KeyW'],
     up: ['ArrowUp', 'KeyW'],
     down: ['ArrowDown', 'KeyS'],
     left: ['ArrowLeft', 'KeyA'],
     right: ['ArrowRight', 'KeyD'],
     confirm: ['Enter', 'Space', 'KeyZ'],
     cancel: ['Escape', 'Backspace', 'KeyX'],
+    moveLeft: ['ArrowLeft', 'KeyA'],
+    moveRight: ['ArrowRight', 'KeyD'],
+    hardDrop: ['ArrowDown', 'KeyS', 'Space'],
+    spinLeft: ['KeyZ', 'KeyQ', 'ShiftLeft'],
+    spinRight: ['KeyX', 'KeyE', 'ArrowUp', 'KeyW'],
     pause: ['Escape', 'KeyP'],
   };
 }
