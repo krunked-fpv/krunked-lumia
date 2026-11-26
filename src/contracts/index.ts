@@ -143,6 +143,151 @@ export const GAME_MODE_ORDER: readonly GameModeId[] = [
   'impossible',
 ] as const;
 
+export const GAME_MODE_CONFIGS: Record<GameModeId, GameModeConfig> = {
+  marathon: {
+    id: 'marathon',
+    name: 'Marathon',
+    description: 'Clear 450 blocks',
+    startLevel: 0,
+    targetBlocks: MARATHON_TARGET_BLOCKS,
+    timeLimitTicks: null,
+    levelIncreases: true,
+    autoClearOnTopOut: false,
+    slackMax: SLACK_MAX_STANDARD,
+    levelScoreBonus: 0,
+    trackPool: 'standard',
+    middleSectionBlocks: 150,
+    outroSectionBlocks: 300,
+    progressGoalBlocks: 450,
+    secretUnlockScore: null,
+    showFallingOnEndgame: false,
+  },
+  endless: {
+    id: 'endless',
+    name: 'Endless',
+    description: 'Play until the board fills up',
+    startLevel: 0,
+    targetBlocks: null,
+    timeLimitTicks: null,
+    levelIncreases: true,
+    autoClearOnTopOut: false,
+    slackMax: SLACK_MAX_STANDARD,
+    levelScoreBonus: 0,
+    trackPool: 'standard',
+    middleSectionBlocks: 300,
+    outroSectionBlocks: 600,
+    progressGoalBlocks: 900,
+    secretUnlockScore: null,
+    showFallingOnEndgame: false,
+  },
+  intense: {
+    id: 'intense',
+    name: 'Intense',
+    description: 'Clear 450 blocks at max level',
+    startLevel: 15,
+    targetBlocks: MARATHON_TARGET_BLOCKS,
+    timeLimitTicks: null,
+    levelIncreases: true,
+    autoClearOnTopOut: false,
+    slackMax: SLACK_MAX_STANDARD,
+    levelScoreBonus: 0,
+    trackPool: 'standard',
+    middleSectionBlocks: 150,
+    outroSectionBlocks: 300,
+    progressGoalBlocks: 450,
+    secretUnlockScore: null,
+    showFallingOnEndgame: false,
+  },
+  relaxed: {
+    id: 'relaxed',
+    name: 'Relaxed',
+    description: "Speed doesn't increase, no failure",
+    startLevel: 0,
+    targetBlocks: null,
+    timeLimitTicks: null,
+    levelIncreases: false,
+    autoClearOnTopOut: true,
+    slackMax: SLACK_MAX_STANDARD,
+    levelScoreBonus: 0,
+    trackPool: 'standard',
+    middleSectionBlocks: 150,
+    outroSectionBlocks: 300,
+    progressGoalBlocks: 450,
+    secretUnlockScore: null,
+    showFallingOnEndgame: false,
+  },
+  rush: {
+    id: 'rush',
+    name: 'Rush',
+    description: 'Play for 2 minutes',
+    startLevel: 0,
+    targetBlocks: null,
+    timeLimitTicks: RUSH_DURATION_TICKS,
+    levelIncreases: true,
+    autoClearOnTopOut: false,
+    slackMax: SLACK_MAX_STANDARD,
+    levelScoreBonus: 0,
+    trackPool: 'rush',
+    middleSectionBlocks: 120,
+    outroSectionBlocks: 240,
+    progressGoalBlocks: 360,
+    secretUnlockScore: null,
+    showFallingOnEndgame: false,
+  },
+  impossible: {
+    id: 'impossible',
+    name: 'Impossible',
+    description: 'Pain.',
+    startLevel: 15,
+    targetBlocks: MARATHON_TARGET_BLOCKS,
+    timeLimitTicks: null,
+    levelIncreases: true,
+    autoClearOnTopOut: false,
+    slackMax: SLACK_MAX_IMPOSSIBLE,
+    levelScoreBonus: IMPOSSIBLE_LEVEL_BONUS,
+    trackPool: 'standard',
+    middleSectionBlocks: 150,
+    outroSectionBlocks: 300,
+    progressGoalBlocks: 450,
+    secretUnlockScore: IMPOSSIBLE_UNLOCK_SCORE,
+    showFallingOnEndgame: true,
+  },
+};
+
+export function createEmptyInputFrame(): InputFrame {
+  return {
+    moveLeft: false,
+    moveRight: false,
+    moveLeftPressed: false,
+    moveRightPressed: false,
+    spinLeftPressed: false,
+    spinRightPressed: false,
+    hardDropPressed: false,
+    usingGamepad: false,
+    moveSpeedIndex: DEFAULT_MOVE_SPEED_INDEX,
+    kbMoveDelay: DEFAULT_KB_MOVE_DELAY,
+    gpMoveDelay: DEFAULT_GP_MOVE_DELAY,
+  };
+}
+
+/** Parse hex string (`#rrggbb` or `rrggbb`) into normalized RGB [0..1]. */
+export function parseHexRgb01(hex: string): [number, number, number] {
+  const clean = hex.replace(/^#/, '').trim();
+  const num = Number.parseInt(clean.length === 6 ? clean : '000000', 16);
+  const r = ((num >> 16) & 0xff) / 255;
+  const g = ((num >> 8) & 0xff) / 255;
+  const b = (num & 0xff) / 255;
+  return [r, g, b];
+}
+
+/** Mixolumia luminance check: light palette if bg luma > 128/255. */
+export function isLightPaletteBg(bgHex: string): boolean {
+  const [r, g, b] = parseHexRgb01(bgHex);
+  const luma255 =
+    (r * BLOOM_LUMA_WEIGHTS[0] + g * BLOOM_LUMA_WEIGHTS[1] + b * BLOOM_LUMA_WEIGHTS[2]) * 255;
+  return luma255 > LIGHT_PALETTE_LUMA_THRESHOLD;
+}
+
 export interface GameModeConfig {
   id: GameModeId;
   name: string;
