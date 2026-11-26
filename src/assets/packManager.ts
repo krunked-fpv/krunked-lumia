@@ -563,20 +563,32 @@ export class PackManager {
       }
     }
 
-    // Load / cache decoded custom audio buffers
+    // Load custom manifests immediately (<15ms), then decode heavy .ogg buffers asynchronously when AudioContext is live
     const ctx = audioEngine.getAudioContext();
     const sourceKey = `idb:${pack.manifest.extractedAt}`;
-    if (!this.cachedAudioPack || this.cachedAudioSourceKey !== sourceKey || this.cachedAudioCtx !== ctx) {
-      this.cachedAudioPack = await loadCustomAudioPackFromBuffers(
-        ctx,
-        pack.audioFiles,
-        pack.manifest,
-      );
-      this.cachedAudioCtx = ctx;
+    if (this.cachedAudioPack && this.cachedAudioSourceKey === sourceKey && this.cachedAudioCtx === ctx) {
+      audioEngine.setPackMode('custom', this.cachedAudioPack);
+    } else if (!ctx) {
+      this.cachedAudioPack = await loadCustomAudioPackFromBuffers(null, pack.audioFiles, pack.manifest);
+      this.cachedAudioCtx = null;
       this.cachedAudioSourceKey = sourceKey;
+      audioEngine.setPackMode('custom', this.cachedAudioPack);
+    } else {
+      const quickPack = await loadCustomAudioPackFromBuffers(null, pack.audioFiles, pack.manifest);
+      audioEngine.setPackMode('custom', quickPack);
+      void loadCustomAudioPackFromBuffers(ctx, pack.audioFiles, pack.manifest)
+        .then((audioPack) => {
+          this.cachedAudioPack = audioPack;
+          this.cachedAudioCtx = ctx;
+          this.cachedAudioSourceKey = sourceKey;
+          if (this.packMode === 'custom') {
+            audioEngine.setPackMode('custom', audioPack);
+          }
+        })
+        .catch(() => {
+          // Keep manifest-only + built-in synthesis fallback cleanly
+        });
     }
-
-    audioEngine.setPackMode('custom', this.cachedAudioPack);
   }
 
   private async applyLocalDevPack(
@@ -634,16 +646,32 @@ export class PackManager {
       );
     }
 
-    // 3. Load / cache custom audio pack from dev-server URLs
+    // 3. Load custom manifests immediately (<15ms), then decode heavy .ogg buffers asynchronously when AudioContext is live
     const ctx = audioEngine.getAudioContext();
     const sourceKey = `local:${this.localBaseUrl}:${manifest.extractedAt}`;
-    if (!this.cachedAudioPack || this.cachedAudioSourceKey !== sourceKey || this.cachedAudioCtx !== ctx) {
-      this.cachedAudioPack = await loadCustomAudioPackFromUrl(ctx, manifest, this.localBaseUrl);
-      this.cachedAudioCtx = ctx;
+    if (this.cachedAudioPack && this.cachedAudioSourceKey === sourceKey && this.cachedAudioCtx === ctx) {
+      audioEngine.setPackMode('custom', this.cachedAudioPack);
+    } else if (!ctx) {
+      this.cachedAudioPack = await loadCustomAudioPackFromUrl(null, manifest, this.localBaseUrl);
+      this.cachedAudioCtx = null;
       this.cachedAudioSourceKey = sourceKey;
+      audioEngine.setPackMode('custom', this.cachedAudioPack);
+    } else {
+      const quickPack = await loadCustomAudioPackFromUrl(null, manifest, this.localBaseUrl);
+      audioEngine.setPackMode('custom', quickPack);
+      void loadCustomAudioPackFromUrl(ctx, manifest, this.localBaseUrl)
+        .then((audioPack) => {
+          this.cachedAudioPack = audioPack;
+          this.cachedAudioCtx = ctx;
+          this.cachedAudioSourceKey = sourceKey;
+          if (this.packMode === 'custom') {
+            audioEngine.setPackMode('custom', audioPack);
+          }
+        })
+        .catch(() => {
+          // Keep manifest-only + built-in synthesis fallback cleanly
+        });
     }
-
-    audioEngine.setPackMode('custom', this.cachedAudioPack);
   }
 
   /** Deletes any saved custom pack from IndexedDB and resets back to Built-In / Local fallback. */

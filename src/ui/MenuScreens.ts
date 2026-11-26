@@ -2623,20 +2623,20 @@ export class MenuScreens {
       ['', 'VEX & VOLT / NOVA OVERDRIVE'],
     ];
 
-    let y = 73;
+    let y = 66;
     for (const [role, credit] of blocks) {
       if (role) {
         renderer.drawTextHex(role, 160, y, ctx.palette.colors[2], 0.72, '3x5', 'center');
         y += 6;
       }
       renderer.drawTextHex(credit, 160, y, ctx.palette.colors[3], 1, '3x5', 'center');
-      y += 9;
+      y += 7;
     }
 
     renderer.drawTextHex(
       t('credits.footer'),
       160,
-      148,
+      149,
       ctx.palette.colors[2],
       0.95,
       '3x5',

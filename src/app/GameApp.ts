@@ -150,6 +150,13 @@ export class GameApp {
         this.startGame(this.selectedMode, this.selectedTrack);
       },
       onEndRunToTitle: () => {
+        if (
+          this.simState &&
+          this.lastRunOutcome === null &&
+          (this.simState.drops > 0 || this.simState.cleared > 0)
+        ) {
+          this.saveManager.recordRunResult(this.simState);
+        }
         this.simState = null;
         this.lastRunOutcome = null;
         this.renderer.effects.reset();
@@ -165,7 +172,7 @@ export class GameApp {
         this.saveManager.save();
       },
       onTogglePackMode: () => {
-        const current = this.saveManager.getSettings().packMode;
+        const current = this.pendingPackMode ?? this.saveManager.getSettings().packMode;
         const next: PackMode = current === 'custom' ? 'builtin' : 'custom';
         void this.setPackMode(next);
       },
@@ -423,13 +430,23 @@ export class GameApp {
     }
   }
 
+  private packSwitchSeq = 0;
+  private pendingPackMode: PackMode | null = null;
+
   async setPackMode(mode: PackMode, options?: { silent?: boolean }): Promise<boolean> {
+    const seq = ++this.packSwitchSeq;
+    this.pendingPackMode = mode;
     const applyPack =
       this.customPackCallbacks.onApplyPackMode ?? this.customPackCallbacks.onSetPackMode;
     if (applyPack) {
       const ok = await applyPack(mode);
+      if (seq !== this.packSwitchSeq) {
+        return ok;
+      }
+      this.pendingPackMode = null;
       if (ok) {
-        if (mode === 'builtin') {
+        this.pendingPackMode = null;
+    if (mode === 'builtin') {
           this.activePackPaletteId = null;
         }
         this.saveManager.updateSettings({ packMode: mode });
@@ -448,6 +465,7 @@ export class GameApp {
       return ok;
     }
 
+    this.pendingPackMode = null;
     if (mode === 'builtin') {
       this.activePackPaletteId = null;
       this.renderer.resetBuiltinAtlas();
@@ -618,7 +636,29 @@ export class GameApp {
     this.debugDrawer.refresh(nowMs);
   };
 
+  private lastViewportCssW = 0;
+  private lastViewportCssH = 0;
+  private lastViewportDpr = 0;
+
+  private syncCanvasViewport(): void {
+    if (typeof window === 'undefined') return;
+    const cssW = this.canvas.clientWidth > 0 ? this.canvas.clientWidth : window.innerWidth;
+    const cssH = this.canvas.clientHeight > 0 ? this.canvas.clientHeight : window.innerHeight;
+    const dpr = window.devicePixelRatio || 1;
+    if (
+      cssW !== this.lastViewportCssW ||
+      cssH !== this.lastViewportCssH ||
+      dpr !== this.lastViewportDpr
+    ) {
+      this.lastViewportCssW = cssW;
+      this.lastViewportCssH = cssH;
+      this.lastViewportDpr = dpr;
+      this.renderer.resize(cssW, cssH, dpr);
+    }
+  }
+
   private renderFrame(interpAlpha: number, dtSec: number): void {
+    this.syncCanvasViewport();
     const settings = this.saveManager.getSettings();
     const palette = this.getActivePalette();
     const profile = this.saveManager.getActiveProfile();
@@ -644,7 +684,12 @@ export class GameApp {
       this.menuScreens.render(this.renderer, this.buildMenuContext());
     }
 
-    this.renderer.endSceneAndPresent(palette, settings.render, dtSec);
+    // Board Zoom applies strictly during gameplay so menus/settings/editors are never clipped
+    const effectiveRenderSettings = isGameplayBacked
+      ? settings.render
+      : { ...settings.render, boardZoom: false };
+
+    this.renderer.endSceneAndPresent(palette, effectiveRenderSettings, dtSec);
   }
 
   private buildMenuContext(): MenuScreenContext {

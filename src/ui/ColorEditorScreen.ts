@@ -1074,7 +1074,7 @@ export class ColorEditorScreen {
         }
         // 3 Sliders
         for (let i = 0; i < 3; i++) {
-          const trackHit: HitRect = { x: 30, y: 74 + i * 17, w: 158, h: 15 };
+          const trackHit: HitRect = { x: 24, y: 74 + i * 17, w: 170, h: 15 };
           if (hitTest(input.mouseX, input.mouseY, trackHit)) {
             this.editZoneIdx = 3 + i;
             this.draggingSlider = i;
@@ -2263,16 +2263,18 @@ export class ColorEditorScreen {
     // 6. Right Safe Preview Panel (Live 68x128 Mini-Board)
     this.renderSafeMiniBoardPreview(renderer, this.getWorkingPalette(), bg);
 
-    // Subtle navigation legend
-    renderer.drawTextHex(
-      'ARROWS / MOUSE DRAG TO TUNE   ESC: BACK',
-      112,
-      164,
-      bg.colors[2],
-      0.62,
-      '3x5',
-      'center',
-    );
+    // Subtle navigation legend (hidden cleanly while a bottom toast is visible so text never overlaps)
+    if (this.toastTimer <= 0) {
+      renderer.drawTextHex(
+        'ARROWS / MOUSE DRAG TO TUNE   ESC: BACK',
+        112,
+        164,
+        bg.colors[2],
+        0.62,
+        '3x5',
+        'center',
+      );
+    }
   }
 
   private renderSliders(renderer: ColorEditorRenderer, bg: Palette, zone: EditFocusZone): void {
