@@ -5,10 +5,13 @@ import {
   GAME_MODE_ORDER,
   LOGICAL_HEIGHT,
   LOGICAL_WIDTH,
+  PORTRAIT_LOGICAL_HEIGHT,
+  PORTRAIT_LOGICAL_WIDTH,
   SIM_DT_MS,
   TARGET_FPS_OPTIONS,
   parseHexRgb01,
   type AppScreen,
+  type ControllerKind,
   type GameModeId,
   type GamepadBindings,
   type KeyboardBindings,
@@ -17,15 +20,22 @@ import {
   type Palette,
   type PaletteColors,
   type PlayerProfile,
+  type PortraitMode,
   type SimState,
   type TargetFps,
+  type TouchControlsMode,
   type TrackId,
   type UserSettings,
 } from '../contracts/index.js';
 import { t } from '../data/localization.js';
 import { MODE_LIST } from '../data/modes.js';
 import { isPaletteLight } from '../data/palettes.js';
-import { NEXT_BLOCK_LOCATIONS } from '../data/settingsDefaults.js';
+import {
+  DEFAULT_TOUCH_OPACITY,
+  NEXT_BLOCK_LOCATIONS,
+  PORTRAIT_MODES,
+  TOUCH_CONTROLS_MODES,
+} from '../data/settingsDefaults.js';
 import { getTrackMeta, getTracksForMode } from '../data/tracks.js';
 import { isModeUnlocked } from '../sim/modes.js';
 import { InputManager, type UiInputState } from '../input/InputManager.js';
@@ -77,6 +87,9 @@ export interface MenuScreenContext {
   hasCustomPackLoader: boolean;
   settingsReturnScreen: AppScreen;
   anyKeyPressed: boolean;
+  isPortraitGameplay?: boolean;
+  controllerKind?: ControllerKind | null;
+  connectedGamepads?: number;
 }
 
 export interface MenuScreenCallbacks {
@@ -228,6 +241,7 @@ export class MenuScreens {
   private settingsTabIdx = 0;
   private settingsRowIdx = 0; // -1 = tab bar focused, 0..N-1 = row focused
   private settingsScrollTop = 0;
+  private draggingSettingsRowId: string | null = null;
   private controlsRemapOpen = false;
 
   private lockShakeTimer = 0;
@@ -339,7 +353,7 @@ export class MenuScreens {
         this.updateTrackSelect(input, ctx, cb);
         break;
       case 'PAUSED':
-        this.updatePaused(input, cb);
+        this.updatePaused(input, ctx, cb);
         break;
       case 'ENDGAME':
         this.updateEndgame(input, ctx, cb);
@@ -402,12 +416,22 @@ export class MenuScreens {
     }
 
     if (this.toastTimer > 0 && this.toastText) {
+      const logicalW =
+        ctx.isPortraitGameplay && (ctx.screen === 'PAUSED' || ctx.screen === 'ENDGAME')
+          ? PORTRAIT_LOGICAL_WIDTH
+          : LOGICAL_WIDTH;
+      const toastY =
+        ctx.isPortraitGameplay && (ctx.screen === 'PAUSED' || ctx.screen === 'ENDGAME')
+          ? PORTRAIT_LOGICAL_HEIGHT - 22
+          : 150;
       const alpha = Math.min(1, this.toastTimer * 2);
-      const display = this.toastText.length > 70 ? `${this.toastText.slice(0, 67)}...` : this.toastText;
-      const w = Math.min(308, display.length * 4 + 14);
-      const x = Math.round((LOGICAL_WIDTH - w) * 0.5);
-      drawBox(renderer, x, 150, w, 12, ctx.palette.colors[1], ctx.palette.colors[3], 0.96 * alpha, alpha);
-      renderer.drawTextHex(display, LOGICAL_WIDTH * 0.5, 154, ctx.palette.colors[3], alpha, '3x5', 'center');
+      const maxChars = logicalW <= 180 ? 38 : 70;
+      const display =
+        this.toastText.length > maxChars ? `${this.toastText.slice(0, maxChars - 3)}...` : this.toastText;
+      const w = Math.min(logicalW - 12, display.length * 4 + 14);
+      const x = Math.round((logicalW - w) * 0.5);
+      drawBox(renderer, x, toastY, w, 12, ctx.palette.colors[1], ctx.palette.colors[3], 0.96 * alpha, alpha);
+      renderer.drawTextHex(display, logicalW * 0.5, toastY + 4, ctx.palette.colors[3], alpha, '3x5', 'center');
     }
   }
 
@@ -458,6 +482,7 @@ export class MenuScreens {
   ): void {
     if (
       ctx.anyKeyPressed ||
+      input.anyGamepadPressed ||
       input.confirm ||
       input.cancel ||
       input.up ||
@@ -899,6 +924,12 @@ export class MenuScreens {
             cb.onPlayMenuMove();
           }
           if (input.mouseClicked) {
+            if (input.isTouchPointer && this.modeIdx !== i) {
+              this.modeIdx = i;
+              cb.onSelectMode(MODE_LIST[i].id);
+              cb.onPlayMenuMove();
+              return;
+            }
             this.modeIdx = i;
             cb.onSelectMode(MODE_LIST[i].id);
             this.confirmMode(MODE_LIST[i].id, ctx, cb);
@@ -1169,6 +1200,13 @@ export class MenuScreens {
             cb.onPlayMenuMove();
           }
           if (input.mouseClicked) {
+            if (input.isTouchPointer && this.trackIdx !== i) {
+              this.trackIdx = i;
+              cb.onSelectTrack(tracks[i].id);
+              cb.onPreviewTrack(tracks[i].id);
+              cb.onPlayMenuMove();
+              return;
+            }
             this.trackIdx = i;
             cb.onPlayMenuSelect();
             cb.onSelectTrack(tracks[i].id);
@@ -1338,12 +1376,16 @@ export class MenuScreens {
     { id: 'end', label: 'END RUN' },
   ] as const;
 
-  private getPauseItemRect(index: number): HitRect {
+  private getPauseItemRect(index: number, portrait = false): HitRect {
+    if (portrait) {
+      return { x: 32, y: 114 + index * 20, w: 116, h: 16 };
+    }
     return { x: 104, y: 64 + index * 16, w: 112, h: 13 };
   }
 
-  private updatePaused(input: UiInputState, cb: MenuScreenCallbacks): void {
+  private updatePaused(input: UiInputState, ctx: MenuScreenContext, cb: MenuScreenCallbacks): void {
     const count = this.pauseItems.length;
+    const portrait = Boolean(ctx.isPortraitGameplay);
     if (input.cancel || input.pause) {
       cb.onPlayMenuBack();
       cb.onResumeRun();
@@ -1360,7 +1402,7 @@ export class MenuScreens {
 
     if (input.mouseInBounds) {
       for (let i = 0; i < count; i++) {
-        if (hitTest(input.mouseX, input.mouseY, this.getPauseItemRect(i))) {
+        if (hitTest(input.mouseX, input.mouseY, this.getPauseItemRect(i, portrait))) {
           if (input.mouseMoved && this.pauseIdx !== i) {
             this.pauseIdx = i;
             cb.onPlayMenuMove();
@@ -1401,23 +1443,32 @@ export class MenuScreens {
   }
 
   private renderPaused(renderer: WebGL2Renderer, ctx: MenuScreenContext): void {
-    renderer.drawRectHex(0, 0, LOGICAL_WIDTH, LOGICAL_HEIGHT, ctx.palette.colors[0], 0.7);
-    drawBox(renderer, 92, 36, 136, 108, ctx.palette.colors[1], ctx.palette.colors[3], 0.96, 1);
+    const portrait = Boolean(ctx.isPortraitGameplay);
+    const fullW = portrait ? PORTRAIT_LOGICAL_WIDTH : LOGICAL_WIDTH;
+    const fullH = portrait ? PORTRAIT_LOGICAL_HEIGHT : LOGICAL_HEIGHT;
+    const centerX = fullW * 0.5;
+    const boxX = portrait ? 22 : 92;
+    const boxY = portrait ? 82 : 36;
+    const boxW = 136;
+    const boxH = portrait ? 124 : 108;
 
-    renderer.drawTextHex('PAUSED', 160, 46, ctx.palette.colors[3], 1, '5x7', 'center');
-    renderer.drawRectHex(106, 56, 108, 1, ctx.palette.colors[2], 0.35);
+    renderer.drawRectHex(0, 0, fullW, fullH, ctx.palette.colors[0], 0.72);
+    drawBox(renderer, boxX, boxY, boxW, boxH, ctx.palette.colors[1], ctx.palette.colors[3], 0.96, 1);
+
+    renderer.drawTextHex('PAUSED', centerX, boxY + 10, ctx.palette.colors[3], 1, '5x7', 'center');
+    renderer.drawRectHex(boxX + 14, boxY + 21, boxW - 28, 1, ctx.palette.colors[2], 0.35);
 
     for (let i = 0; i < this.pauseItems.length; i++) {
-      const rect = this.getPauseItemRect(i);
+      const rect = this.getPauseItemRect(i, portrait);
       const selected = i === this.pauseIdx;
       if (selected) {
         drawBox(renderer, rect.x, rect.y, rect.w, rect.h, ctx.palette.colors[0], ctx.palette.colors[3], 0.9, 1);
-        renderer.drawSpriteHex('arrow_spr', 0, rect.x + 8, rect.y + 6, ctx.palette.colors[3], 1);
+        renderer.drawSpriteHex('arrow_spr', 0, rect.x + 8, rect.y + Math.floor(rect.h * 0.5), ctx.palette.colors[3], 1);
       }
       renderer.drawTextHex(
         this.pauseItems[i].label,
-        160,
-        rect.y + 3,
+        centerX,
+        rect.y + Math.floor((rect.h - 7) * 0.5),
         selected ? ctx.palette.colors[3] : ctx.palette.colors[2],
         1,
         '5x7',
@@ -1436,7 +1487,10 @@ export class MenuScreens {
     { id: 'menu', label: 'BACK TO MENU' },
   ] as const;
 
-  private getEndgameItemRect(index: number): HitRect {
+  private getEndgameItemRect(index: number, portrait = false): HitRect {
+    if (portrait) {
+      return { x: 96, y: 244 + index * 20, w: 74, h: 16 };
+    }
     return { x: 204, y: 74 + index * 18, w: 106, h: 15 };
   }
 
@@ -1446,6 +1500,7 @@ export class MenuScreens {
     cb: MenuScreenCallbacks,
   ): void {
     const count = this.endgameItems.length;
+    const portrait = Boolean(ctx.isPortraitGameplay);
     if (input.cancel) {
       cb.onPlayMenuBack();
       cb.onEndRunToTitle();
@@ -1462,7 +1517,7 @@ export class MenuScreens {
 
     if (input.mouseInBounds) {
       for (let i = 0; i < count; i++) {
-        if (hitTest(input.mouseX, input.mouseY, this.getEndgameItemRect(i))) {
+        if (hitTest(input.mouseX, input.mouseY, this.getEndgameItemRect(i, portrait))) {
           if (input.mouseMoved && this.endgameIdx !== i) {
             this.endgameIdx = i;
             cb.onPlayMenuMove();
@@ -1499,6 +1554,10 @@ export class MenuScreens {
   }
 
   private renderEndgame(renderer: WebGL2Renderer, ctx: MenuScreenContext): void {
+    if (ctx.isPortraitGameplay) {
+      this.renderPortraitEndgame(renderer, ctx);
+      return;
+    }
     const sim = ctx.simState;
     const outcome = ctx.lastRunOutcome;
     const isVictory = sim?.phase === 'VICTORY';
@@ -1602,6 +1661,96 @@ export class MenuScreens {
         selected ? ctx.palette.colors[3] : ctx.palette.colors[2],
         1,
         '5x7',
+        'center',
+      );
+    }
+  }
+
+  private renderPortraitEndgame(renderer: WebGL2Renderer, ctx: MenuScreenContext): void {
+    const sim = ctx.simState;
+    const outcome = ctx.lastRunOutcome;
+    const isVictory = sim?.phase === 'VICTORY';
+
+    // Keep central 68x128 diamond board at (56, 54) 100% visible!
+    renderer.drawRectHex(0, 0, PORTRAIT_LOGICAL_WIDTH, 50, ctx.palette.colors[0], 0.76);
+    renderer.drawRectHex(0, 186, PORTRAIT_LOGICAL_WIDTH, PORTRAIT_LOGICAL_HEIGHT - 186, ctx.palette.colors[0], 0.78);
+    renderer.drawRectHex(0, 50, 52, 136, ctx.palette.colors[0], 0.58);
+    renderer.drawRectHex(128, 50, 52, 136, ctx.palette.colors[0], 0.58);
+
+    const heading = isVictory ? 'FINISH!' : 'GAME OVER';
+    const headColor = isVictory ? ctx.palette.colors[3] : ctx.palette.colors[5];
+    drawBox(renderer, 26, 6, 128, 16, ctx.palette.colors[1], headColor, 0.94, 1);
+    renderer.drawTextHex(heading, 90, 10, headColor, 1, '5x7', 'center');
+
+    const modeName = GAME_MODE_CONFIGS[ctx.selectedMode].name.toUpperCase();
+    const trackTitle = getTrackMeta(ctx.selectedTrack).title.toUpperCase();
+    renderer.drawTextHex(`${modeName} | ${trackTitle}`, 90, 27, ctx.palette.colors[2], 0.88, '3x5', 'center');
+
+    // Lower results & actions card (y = 188..312)
+    drawBox(renderer, 6, 188, 168, 124, ctx.palette.colors[1], ctx.palette.colors[2], 0.95, 0.9);
+
+    const score = sim?.score ?? 0;
+    const cleared = sim?.cleared ?? 0;
+    const maxCombo = sim?.maxCombo ?? 0;
+    const perfects = sim?.perfectClears ?? 0;
+    const elapsedMs = outcome?.elapsedMs ?? Math.round((sim?.elapsedTicks ?? 0) * SIM_DT_MS);
+
+    renderer.drawTextHex('FINAL SCORE', 12, 194, ctx.palette.colors[2], 0.78, '3x5', 'left');
+    if (outcome?.isNewHighScore) {
+      renderer.drawTextHex('NEW BEST!', 168, 194, ctx.palette.colors[3], 1, '3x5', 'right');
+    }
+    renderer.drawTextHex(
+      score.toLocaleString('en-US'),
+      12,
+      202,
+      outcome?.isNewHighScore ? ctx.palette.colors[3] : ctx.palette.colors[2],
+      1,
+      '5x7',
+      'left',
+    );
+    renderer.drawRectHex(12, 213, 156, 1, ctx.palette.colors[2], 0.25);
+
+    const rows: [string, string][] = [
+      ['CLEARED', String(cleared)],
+      ['TIME', formatHudTime(elapsedMs, ctx.settings.gameplay.preciseTimer)],
+      ['COMBO', maxCombo > 0 ? `x${maxCombo}` : '--'],
+      ['PERFECTS', String(perfects)],
+      ['LEVEL', String(sim?.level ?? 0)],
+    ];
+    for (let i = 0; i < rows.length; i++) {
+      const ry = 220 + i * 14;
+      renderer.drawTextHex(rows[i][0], 12, ry, ctx.palette.colors[2], 0.78, '3x5', 'left');
+      renderer.drawTextHex(rows[i][1], 88, ry, ctx.palette.colors[3], 1, '3x5', 'right');
+    }
+
+    if (outcome?.impossibleNewlyUnlocked) {
+      renderer.drawTextHex('IMPOSSIBLE UNLOCKED!', 90, 299, ctx.palette.colors[5], 1, '3x5', 'center');
+    } else if (outcome?.fastestTimeBeaten) {
+      renderer.drawTextHex('NEW FASTEST TIME!', 90, 299, ctx.palette.colors[3], 1, '3x5', 'center');
+    }
+
+    const shortLabels = ['PLAY AGAIN', 'TRACKS', 'MAIN MENU'] as const;
+    for (let i = 0; i < this.endgameItems.length; i++) {
+      const rect = this.getEndgameItemRect(i, true);
+      const selected = i === this.endgameIdx;
+      drawBox(
+        renderer,
+        rect.x,
+        rect.y,
+        rect.w,
+        rect.h,
+        ctx.palette.colors[0],
+        selected ? ctx.palette.colors[3] : ctx.palette.colors[2],
+        selected ? 0.95 : 0.48,
+        selected ? 1 : 0.45,
+      );
+      renderer.drawTextHex(
+        shortLabels[i],
+        rect.x + rect.w * 0.5,
+        rect.y + 5,
+        selected ? ctx.palette.colors[3] : ctx.palette.colors[2],
+        1,
+        '3x5',
         'center',
       );
     }
@@ -1764,6 +1913,48 @@ export class MenuScreens {
             activate: () => cb.onUpdateSettings({ gameplay: { gamepadRumble: !gameplay.gamepadRumble } }),
           },
           {
+            id: 'touchControlsMode',
+            label: 'TOUCH CONTROLS',
+            valueText: (gameplay.touchControlsMode ?? 'auto').toUpperCase(),
+            desc: t('settings.touchControlsMode.desc'),
+            kind: 'cycle',
+            adjust: (dir) => {
+              const cur = gameplay.touchControlsMode ?? 'auto';
+              const idx = TOUCH_CONTROLS_MODES.indexOf(cur);
+              const next: TouchControlsMode =
+                TOUCH_CONTROLS_MODES[(idx + dir + TOUCH_CONTROLS_MODES.length) % TOUCH_CONTROLS_MODES.length];
+              cb.onUpdateSettings({ gameplay: { touchControlsMode: next } });
+            },
+            activate: () => {
+              const cur = gameplay.touchControlsMode ?? 'auto';
+              const idx = TOUCH_CONTROLS_MODES.indexOf(cur);
+              const next: TouchControlsMode = TOUCH_CONTROLS_MODES[(idx + 1) % TOUCH_CONTROLS_MODES.length];
+              cb.onUpdateSettings({ gameplay: { touchControlsMode: next } });
+            },
+          },
+          {
+            id: 'touchOpacity',
+            label: 'TOUCH OPACITY',
+            valueText: `${Math.round((gameplay.touchOpacity ?? DEFAULT_TOUCH_OPACITY) * 100)}%`,
+            desc: t('settings.touchOpacity.desc'),
+            kind: 'slider',
+            sliderRatio: ((gameplay.touchOpacity ?? DEFAULT_TOUCH_OPACITY) - 0.25) / 0.7,
+            adjust: (dir) => {
+              const cur = gameplay.touchOpacity ?? DEFAULT_TOUCH_OPACITY;
+              const next = Math.max(0.25, Math.min(0.95, Math.round((cur + dir * 0.05) * 20) / 20));
+              cb.onUpdateSettings({ gameplay: { touchOpacity: next } });
+            },
+            activate: () => {
+              const cur = gameplay.touchOpacity ?? DEFAULT_TOUCH_OPACITY;
+              const next = cur >= 0.9 ? 0.35 : Math.min(0.95, Math.round((cur + 0.15) * 20) / 20);
+              cb.onUpdateSettings({ gameplay: { touchOpacity: next } });
+            },
+            setRatio: (r) => {
+              const next = Math.max(0.25, Math.min(0.95, Math.round((0.25 + r * 0.7) * 20) / 20));
+              cb.onUpdateSettings({ gameplay: { touchOpacity: next } });
+            },
+          },
+          {
             id: 'mapKeyboard',
             label: 'MAP KEYBOARD',
             valueText: 'REMAP >',
@@ -1893,6 +2084,26 @@ export class MenuScreens {
             kind: 'toggle',
             adjust: () => cb.onUpdateSettings({ render: { boardZoom: !render.boardZoom } }),
             activate: () => cb.onUpdateSettings({ render: { boardZoom: !render.boardZoom } }),
+          },
+          {
+            id: 'portraitMode',
+            label: 'PORTRAIT MODE',
+            valueText: (render.portraitMode ?? 'auto').toUpperCase(),
+            desc: t('settings.portraitMode.desc'),
+            kind: 'cycle',
+            adjust: (dir) => {
+              const cur = render.portraitMode ?? 'auto';
+              const idx = PORTRAIT_MODES.indexOf(cur);
+              const next: PortraitMode =
+                PORTRAIT_MODES[(idx + dir + PORTRAIT_MODES.length) % PORTRAIT_MODES.length];
+              cb.onUpdateSettings({ render: { portraitMode: next } });
+            },
+            activate: () => {
+              const cur = render.portraitMode ?? 'auto';
+              const idx = PORTRAIT_MODES.indexOf(cur);
+              const next: PortraitMode = PORTRAIT_MODES[(idx + 1) % PORTRAIT_MODES.length];
+              cb.onUpdateSettings({ render: { portraitMode: next } });
+            },
           },
           {
             id: 'tateRotate',
@@ -2037,6 +2248,28 @@ export class MenuScreens {
     }
 
     const maxVisible = 7;
+    const maxScroll = Math.max(0, rows.length - maxVisible);
+
+    // Clear active slider drag on release
+    if (!input.mouseDown) {
+      this.draggingSettingsRowId = null;
+    }
+
+    // Continuous slider drag (mouse & touch!)
+    if (this.draggingSettingsRowId && input.mouseDown && input.mouseInBounds) {
+      const draggedRow = rows.find((r) => r.id === this.draggingSettingsRowId);
+      if (draggedRow && draggedRow.kind === 'slider' && draggedRow.setRatio) {
+        const ratio = Math.max(0, Math.min(1, (input.mouseX - 176) / 82));
+        draggedRow.setRatio(ratio);
+        return;
+      }
+    }
+
+    // Touch swipe & mouse wheel scrolling
+    if (input.scrollDelta && Math.abs(input.scrollDelta) >= 8 && maxScroll > 0) {
+      const steps = Math.sign(input.scrollDelta) * Math.max(1, Math.round(Math.abs(input.scrollDelta) / 16));
+      this.settingsScrollTop = Math.max(0, Math.min(maxScroll, this.settingsScrollTop + steps));
+    }
 
     if (input.up) {
       if (this.settingsRowIdx <= 0) {
@@ -2071,21 +2304,45 @@ export class MenuScreens {
       cb.onPlayMenuSelect();
     }
 
-    // Mouse hover + click on visible settings rows
+    // Mouse / Touch hover, slider drag, scrollbar & click on visible settings rows
     if (input.mouseInBounds) {
+      if (maxScroll > 0 && (input.mouseClicked || input.mouseDown)) {
+        const trackHit: HitRect = { x: 304, y: 34, w: 14, h: maxVisible * 16 + 8 };
+        if (hitTest(input.mouseX, input.mouseY, trackHit)) {
+          const frac = Math.max(0, Math.min(1, (input.mouseY - 38) / Math.max(1, maxVisible * 16 - 2)));
+          this.settingsScrollTop = Math.round(frac * maxScroll);
+          return;
+        }
+      }
+
       const visibleEnd = Math.min(rows.length, this.settingsScrollTop + maxVisible);
       for (let idx = this.settingsScrollTop; idx < visibleEnd; idx++) {
         const slot = idx - this.settingsScrollTop;
         const rowRect: HitRect = { x: 14, y: 38 + slot * 16, w: 292, h: 14 };
         if (hitTest(input.mouseX, input.mouseY, rowRect)) {
+          const row = rows[idx];
           if (input.mouseMoved && this.settingsRowIdx !== idx) {
             this.settingsRowIdx = idx;
             cb.onPlayMenuMove();
           }
+          // Immediate touch/mouse grab on slider rail enables smooth dragging
+          if (
+            row.kind === 'slider' &&
+            row.setRatio &&
+            input.mouseDown &&
+            input.mouseX >= 172 &&
+            input.mouseX <= 262
+          ) {
+            this.settingsRowIdx = idx;
+            this.draggingSettingsRowId = row.id;
+            const ratio = Math.max(0, Math.min(1, (input.mouseX - 176) / 82));
+            row.setRatio(ratio);
+            return;
+          }
           if (input.mouseClicked) {
             this.settingsRowIdx = idx;
-            const row = rows[idx];
-            if (row.kind === 'slider' && row.setRatio && input.mouseX >= 176 && input.mouseX <= 258) {
+            if (row.kind === 'slider' && row.setRatio && input.mouseX >= 172 && input.mouseX <= 262) {
+              this.draggingSettingsRowId = row.id;
               const ratio = Math.max(0, Math.min(1, (input.mouseX - 176) / 82));
               row.setRatio(ratio);
               cb.onPlayMenuMove();
@@ -2315,16 +2572,32 @@ export class MenuScreens {
       }
     }
 
-    // Scroll indicator if more than 7 rows
+    // Scroll indicator + crisp pixel up/down cues if more than 7 rows
     if (rows.length > maxVisible) {
       const trackX = 309;
-      const trackY = 38;
-      const trackH = maxVisible * 16 - 2;
+      const trackY = 44;
+      const trackH = maxVisible * 16 - 14;
+      renderer.drawSpriteHex(
+        'arrow_spr',
+        2,
+        trackX + 1,
+        39,
+        this.settingsScrollTop > 0 ? ctx.palette.colors[3] : ctx.palette.colors[2],
+        this.settingsScrollTop > 0 ? 1 : 0.35,
+      );
       renderer.drawRectHex(trackX, trackY, 2, trackH, ctx.palette.colors[1], 0.9);
       const thumbH = Math.max(12, Math.round((maxVisible / rows.length) * trackH));
       const maxScroll = Math.max(1, rows.length - maxVisible);
       const thumbY = trackY + Math.round((this.settingsScrollTop / maxScroll) * (trackH - thumbH));
       renderer.drawRectHex(trackX, thumbY, 2, thumbH, ctx.palette.colors[3], 1);
+      renderer.drawSpriteHex(
+        'arrow_spr',
+        3,
+        trackX + 1,
+        trackY + trackH + 5,
+        this.settingsScrollTop < maxScroll ? ctx.palette.colors[3] : ctx.palette.colors[2],
+        this.settingsScrollTop < maxScroll ? 1 : 0.35,
+      );
     }
 
     // Description footer

@@ -5,6 +5,8 @@ import {
   LOGICAL_HEIGHT,
   LOGICAL_WIDTH,
   parseHexRgb01,
+  PORTRAIT_LOGICAL_HEIGHT,
+  PORTRAIT_LOGICAL_WIDTH,
   type Palette,
   type RenderSettings,
   type SpriteAssetEntry,
@@ -36,6 +38,13 @@ import { ParticlesAndBg, type ParticleRenderTarget } from './ParticlesAndBg.js';
 
 export const BOARD_ZOOM_FACTOR = 1.25;
 
+export interface SafeAreaInsets {
+  top: number;
+  right: number;
+  bottom: number;
+  left: number;
+}
+
 export interface ViewportTransform {
   canvasCssWidth: number;
   canvasCssHeight: number;
@@ -45,6 +54,8 @@ export interface ViewportTransform {
   viewH: number; // CSS px height of letterboxed logical viewport
   tateRotate: boolean;
   boardZoom: boolean;
+  logicalWidth?: number;
+  logicalHeight?: number;
 }
 
 interface RenderTarget {
@@ -102,18 +113,24 @@ function createRenderTarget(
 
 /**
  * Computes centered aspect-preserving letterbox rect inside a container of size (W, H).
- * Normal mode preserves 320:180 (16:9); Tate 90-degree rotated mode preserves 180:320 (9:16).
+ * Supports both native 320:180 (16:9) landscape and 180:320 (9:16) portrait logical viewports,
+ * plus 90-degree Tate rotation and optional mobile safe-area inset margins.
  */
 export function computeLetterboxRect(
   containerW: number,
   containerH: number,
   tateRotate: boolean,
+  logicalW = LOGICAL_WIDTH,
+  logicalH = LOGICAL_HEIGHT,
+  insets?: SafeAreaInsets,
 ): { x: number; y: number; w: number; h: number } {
-  const safeW = Math.max(1, containerW);
-  const safeH = Math.max(1, containerH);
-  const targetAspect = tateRotate
-    ? LOGICAL_HEIGHT / LOGICAL_WIDTH
-    : LOGICAL_WIDTH / LOGICAL_HEIGHT;
+  const padL = Math.max(0, insets?.left ?? 0);
+  const padR = Math.max(0, insets?.right ?? 0);
+  const padT = Math.max(0, insets?.top ?? 0);
+  const padB = Math.max(0, insets?.bottom ?? 0);
+  const safeW = Math.max(1, containerW - padL - padR);
+  const safeH = Math.max(1, containerH - padT - padB);
+  const targetAspect = tateRotate ? logicalH / logicalW : logicalW / logicalH;
   const containerAspect = safeW / safeH;
 
   let w: number;
@@ -125,8 +142,8 @@ export function computeLetterboxRect(
     w = safeW;
     h = w / targetAspect;
   }
-  const x = (safeW - w) * 0.5;
-  const y = (safeH - h) * 0.5;
+  const x = padL + (safeW - w) * 0.5;
+  const y = padT + (safeH - h) * 0.5;
   return { x, y, w, h };
 }
 
@@ -148,6 +165,16 @@ export class WebGL2Renderer implements ParticleRenderTarget {
   private readonly bloomExtractTarget: RenderTarget;
   private readonly blurHTarget: RenderTarget;
   private readonly blurVTarget: RenderTarget;
+
+  // Companion 180x320 portrait FBO chain (exact 9:16 transpose, GL_NEAREST scene)
+  private readonly portraitSceneTarget: RenderTarget;
+  private readonly portraitBloomExtractTarget: RenderTarget;
+  private readonly portraitBlurHTarget: RenderTarget;
+  private readonly portraitBlurVTarget: RenderTarget;
+  private activeLogicalWidth = LOGICAL_WIDTH;
+  private activeLogicalHeight = LOGICAL_HEIGHT;
+  private activePortrait = false;
+  private safeAreaInsets: SafeAreaInsets = { top: 0, right: 0, bottom: 0, left: 0 };
 
   private readonly fullscreenVao: WebGLVertexArrayObject;
   private readonly bloomExtractProgram: WebGLProgram;
@@ -241,6 +268,12 @@ export class WebGL2Renderer implements ParticleRenderTarget {
     this.bloomExtractTarget = createRenderTarget(gl, LOGICAL_WIDTH, LOGICAL_HEIGHT, gl.LINEAR);
     this.blurHTarget = createRenderTarget(gl, LOGICAL_WIDTH, LOGICAL_HEIGHT, gl.LINEAR);
     this.blurVTarget = createRenderTarget(gl, LOGICAL_WIDTH, LOGICAL_HEIGHT, gl.LINEAR);
+
+    // Companion 180x320 portrait FBO chain (scene GL_NEAREST, bloom/blur GL_LINEAR)
+    this.portraitSceneTarget = createRenderTarget(gl, PORTRAIT_LOGICAL_WIDTH, PORTRAIT_LOGICAL_HEIGHT, gl.NEAREST);
+    this.portraitBloomExtractTarget = createRenderTarget(gl, PORTRAIT_LOGICAL_WIDTH, PORTRAIT_LOGICAL_HEIGHT, gl.LINEAR);
+    this.portraitBlurHTarget = createRenderTarget(gl, PORTRAIT_LOGICAL_WIDTH, PORTRAIT_LOGICAL_HEIGHT, gl.LINEAR);
+    this.portraitBlurVTarget = createRenderTarget(gl, PORTRAIT_LOGICAL_WIDTH, PORTRAIT_LOGICAL_HEIGHT, gl.LINEAR);
 
     // Compile all 4 post/effect shader programs
     this.bloomExtractProgram = compileProgram(gl, FULLSCREEN_VERT_SRC, BLOOM_FILTER_LUMINANCE_FRAG_SRC);
@@ -342,8 +375,32 @@ export class WebGL2Renderer implements ParticleRenderTarget {
     }
   }
 
+  setSafeAreaInsets(insets: SafeAreaInsets): void {
+    this.safeAreaInsets = {
+      top: Math.max(0, insets.top),
+      right: Math.max(0, insets.right),
+      bottom: Math.max(0, insets.bottom),
+      left: Math.max(0, insets.left),
+    };
+  }
+
+  getActiveLogicalSize(): { width: number; height: number; portrait: boolean } {
+    return {
+      width: this.activeLogicalWidth,
+      height: this.activeLogicalHeight,
+      portrait: this.activePortrait,
+    };
+  }
+
   getViewportTransform(): ViewportTransform {
-    const rect = computeLetterboxRect(this.cssWidth, this.cssHeight, this.lastTateRotate);
+    const rect = computeLetterboxRect(
+      this.cssWidth,
+      this.cssHeight,
+      this.lastTateRotate,
+      this.activeLogicalWidth,
+      this.activeLogicalHeight,
+      this.safeAreaInsets,
+    );
     return {
       canvasCssWidth: this.cssWidth,
       canvasCssHeight: this.cssHeight,
@@ -353,15 +410,22 @@ export class WebGL2Renderer implements ParticleRenderTarget {
       viewH: rect.h,
       tateRotate: this.lastTateRotate,
       boardZoom: this.lastBoardZoom,
+      logicalWidth: this.activeLogicalWidth,
+      logicalHeight: this.activeLogicalHeight,
     };
   }
 
-  beginScene(palette: Palette): void {
+  beginScene(palette: Palette, portrait = false): void {
     const gl = this.gl;
     const [bgR, bgG, bgB] = parseHexRgb01(palette.colors[0]);
 
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.sceneTarget.fbo);
-    gl.viewport(0, 0, LOGICAL_WIDTH, LOGICAL_HEIGHT);
+    this.activePortrait = portrait;
+    this.activeLogicalWidth = portrait ? PORTRAIT_LOGICAL_WIDTH : LOGICAL_WIDTH;
+    this.activeLogicalHeight = portrait ? PORTRAIT_LOGICAL_HEIGHT : LOGICAL_HEIGHT;
+    const sceneTarget = portrait ? this.portraitSceneTarget : this.sceneTarget;
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, sceneTarget.fbo);
+    gl.viewport(0, 0, this.activeLogicalWidth, this.activeLogicalHeight);
     gl.disable(gl.DEPTH_TEST);
     gl.disable(gl.CULL_FACE);
     gl.enable(gl.BLEND);
@@ -369,7 +433,7 @@ export class WebGL2Renderer implements ParticleRenderTarget {
     gl.clearColor(bgR, bgG, bgB, 1.0);
     gl.clear(gl.COLOR_BUFFER_BIT);
 
-    this.batch.begin(LOGICAL_WIDTH, LOGICAL_HEIGHT);
+    this.batch.begin(this.activeLogicalWidth, this.activeLogicalHeight);
   }
 
   drawSprite(
@@ -529,7 +593,7 @@ export class WebGL2Renderer implements ParticleRenderTarget {
     const [r2, g2, b2] = typeof col2 === 'string' ? parseHexRgb01(col2) : col2;
 
     gl.useProgram(this.colorThresholdProgram);
-    gl.uniform2f(this.thresholdLocs.resolution, LOGICAL_WIDTH, LOGICAL_HEIGHT);
+    gl.uniform2f(this.thresholdLocs.resolution, this.activeLogicalWidth, this.activeLogicalHeight);
     gl.uniform4f(
       this.thresholdLocs.rect,
       Math.round(x),
@@ -571,39 +635,48 @@ export class WebGL2Renderer implements ParticleRenderTarget {
     const isLight = isLightPaletteBg(palette.colors[0]);
     const bloomIntensity = Math.max(0, settings.bloomAmount) * this.bloomActual;
 
+    const sceneTarget = this.activePortrait ? this.portraitSceneTarget : this.sceneTarget;
+    const bloomExtractTarget = this.activePortrait
+      ? this.portraitBloomExtractTarget
+      : this.bloomExtractTarget;
+    const blurHTarget = this.activePortrait ? this.portraitBlurHTarget : this.blurHTarget;
+    const blurVTarget = this.activePortrait ? this.portraitBlurVTarget : this.blurVTarget;
+    const activeW = this.activeLogicalWidth;
+    const activeH = this.activeLogicalHeight;
+
     gl.disable(gl.BLEND);
     gl.bindVertexArray(this.fullscreenVao);
 
     if (bloomIntensity > 0.0005) {
-      // Pass 1: bloom_filter_luminance_shd (320x180)
-      gl.bindFramebuffer(gl.FRAMEBUFFER, this.bloomExtractTarget.fbo);
-      gl.viewport(0, 0, LOGICAL_WIDTH, LOGICAL_HEIGHT);
+      // Pass 1: bloom_filter_luminance_shd (active logical W x H)
+      gl.bindFramebuffer(gl.FRAMEBUFFER, bloomExtractTarget.fbo);
+      gl.viewport(0, 0, activeW, activeH);
       gl.useProgram(this.bloomExtractProgram);
       gl.activeTexture(gl.TEXTURE0);
-      gl.bindTexture(gl.TEXTURE_2D, this.sceneTarget.texture);
+      gl.bindTexture(gl.TEXTURE_2D, sceneTarget.texture);
       gl.uniform1i(this.bloomLocs.tex, 0);
       gl.uniform1f(this.bloomLocs.threshold, isLight ? 0.2 : 0.28);
       gl.uniform1f(this.bloomLocs.range, 0.45);
       gl.uniform1f(this.bloomLocs.isLight, isLight ? 1.0 : 0.0);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
 
-      // Pass 2: blur_2_pass_gauss_lerp_shd horizontal (1/320, 0)
-      gl.bindFramebuffer(gl.FRAMEBUFFER, this.blurHTarget.fbo);
-      gl.viewport(0, 0, LOGICAL_WIDTH, LOGICAL_HEIGHT);
+      // Pass 2: blur_2_pass_gauss_lerp_shd horizontal (1/activeW, 0)
+      gl.bindFramebuffer(gl.FRAMEBUFFER, blurHTarget.fbo);
+      gl.viewport(0, 0, activeW, activeH);
       gl.useProgram(this.blurProgram);
       gl.activeTexture(gl.TEXTURE0);
-      gl.bindTexture(gl.TEXTURE_2D, this.bloomExtractTarget.texture);
+      gl.bindTexture(gl.TEXTURE_2D, bloomExtractTarget.texture);
       gl.uniform1i(this.blurLocs.tex, 0);
-      gl.uniform2f(this.blurLocs.texelStep, 1 / LOGICAL_WIDTH, 0);
+      gl.uniform2f(this.blurLocs.texelStep, 1 / activeW, 0);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
 
-      // Pass 3: blur_2_pass_gauss_lerp_shd vertical (0, 1/180)
-      gl.bindFramebuffer(gl.FRAMEBUFFER, this.blurVTarget.fbo);
-      gl.viewport(0, 0, LOGICAL_WIDTH, LOGICAL_HEIGHT);
+      // Pass 3: blur_2_pass_gauss_lerp_shd vertical (0, 1/activeH)
+      gl.bindFramebuffer(gl.FRAMEBUFFER, blurVTarget.fbo);
+      gl.viewport(0, 0, activeW, activeH);
       gl.activeTexture(gl.TEXTURE0);
-      gl.bindTexture(gl.TEXTURE_2D, this.blurHTarget.texture);
+      gl.bindTexture(gl.TEXTURE_2D, blurHTarget.texture);
       gl.uniform1i(this.blurLocs.tex, 0);
-      gl.uniform2f(this.blurLocs.texelStep, 0, 1 / LOGICAL_HEIGHT);
+      gl.uniform2f(this.blurLocs.texelStep, 0, 1 / activeH);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
     }
 
@@ -617,16 +690,30 @@ export class WebGL2Renderer implements ParticleRenderTarget {
     gl.clearColor(bgR, bgG, bgB, 1.0);
     gl.clear(gl.COLOR_BUFFER_BIT);
 
-    const vp = computeLetterboxRect(this.canvas.width, this.canvas.height, settings.tateRotate);
-    gl.viewport(Math.round(vp.x), Math.round(vp.y), Math.round(vp.w), Math.round(vp.h));
+    const scaledInsets: SafeAreaInsets = {
+      top: this.safeAreaInsets.top * this.dpr,
+      right: this.safeAreaInsets.right * this.dpr,
+      bottom: this.safeAreaInsets.bottom * this.dpr,
+      left: this.safeAreaInsets.left * this.dpr,
+    };
+    const vp = computeLetterboxRect(
+      this.canvas.width,
+      this.canvas.height,
+      settings.tateRotate,
+      activeW,
+      activeH,
+      scaledInsets,
+    );
+    const glVpY = this.canvas.height - vp.y - vp.h;
+    gl.viewport(Math.round(vp.x), Math.round(glVpY), Math.round(vp.w), Math.round(vp.h));
 
     gl.useProgram(this.presentProgram);
     gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, this.sceneTarget.texture);
+    gl.bindTexture(gl.TEXTURE_2D, sceneTarget.texture);
     gl.uniform1i(this.presentLocs.baseTex, 0);
 
     gl.activeTexture(gl.TEXTURE1);
-    gl.bindTexture(gl.TEXTURE_2D, this.blurVTarget.texture);
+    gl.bindTexture(gl.TEXTURE_2D, blurVTarget.texture);
     gl.uniform1i(this.presentLocs.bloomTex, 1);
 
     gl.uniform1f(this.presentLocs.bloomIntensity, bloomIntensity);
@@ -747,6 +834,10 @@ export class WebGL2Renderer implements ParticleRenderTarget {
       this.bloomExtractTarget,
       this.blurHTarget,
       this.blurVTarget,
+      this.portraitSceneTarget,
+      this.portraitBloomExtractTarget,
+      this.portraitBlurHTarget,
+      this.portraitBlurVTarget,
     ];
     for (const t of targets) {
       gl.deleteFramebuffer(t.fbo);

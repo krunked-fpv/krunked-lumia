@@ -2,8 +2,12 @@ import {
   BOARD_HEIGHT,
   BOARD_WIDTH,
   CELL_EMPTY,
+  CONTAINER_HEIGHT,
+  CONTAINER_WIDTH,
   GAME_MODE_CONFIGS,
   LOGICAL_WIDTH,
+  PORTRAIT_LOGICAL_HEIGHT,
+  PORTRAIT_LOGICAL_WIDTH,
   SIM_DT_MS,
   isLightPaletteBg,
   parseHexRgb01,
@@ -16,6 +20,7 @@ import {
   type UserSettings,
 } from '../contracts/index.js';
 import { getModeDetails } from '../data/modes.js';
+import type { InputDeviceKind } from '../input/InputManager.js';
 import {
   cellToContainerPixel,
   computeGhostPosition,
@@ -28,6 +33,8 @@ import { getTutorialProgress } from '../sim/tutorial.js';
 import {
   DEFAULT_CONTAINER_ORIGIN_X,
   DEFAULT_CONTAINER_ORIGIN_Y,
+  PORTRAIT_CONTAINER_ORIGIN_X,
+  PORTRAIT_CONTAINER_ORIGIN_Y,
 } from '../render/ParticlesAndBg.js';
 import type { WebGL2Renderer } from '../render/WebGL2Renderer.js';
 
@@ -43,10 +50,28 @@ const TUTORIAL_ICON_FRAME: Record<TutorialStep, number> = {
   DONE: 4,
 };
 
-const TUTORIAL_SHORT_HINTS: Record<TutorialStep, [string, string]> = {
+const TUTORIAL_SHORT_HINTS_KB: Record<TutorialStep, [string, string]> = {
   MOVE: ['LEFT / RIGHT', 'GLIDE ON WALLS'],
   SPIN: ['SPIN CW / CCW', 'CYCLE 4 COLORS'],
   DROP: ['HARD DROP', 'LOCK + SLIDE'],
+  MATCH: ['MATCH 3+ DIAG', 'OR 2X2 DIAMOND'],
+  ADVANCED: ['CHAIN CLEARS', 'UP TO 4X COMBO'],
+  DONE: ['FLOW WITH THE', 'HARMONIC PULSE'],
+};
+
+const TUTORIAL_SHORT_HINTS_TOUCH: Record<TutorialStep, [string, string]> = {
+  MOVE: ['DRAG STICK L/R', 'GLIDE ON WALLS'],
+  SPIN: ['TAP CCW / CW', 'CYCLE 4 COLORS'],
+  DROP: ['TAP DROP / DN', 'LOCK + SLIDE'],
+  MATCH: ['MATCH 3+ DIAG', 'OR 2X2 DIAMOND'],
+  ADVANCED: ['CHAIN CLEARS', 'UP TO 4X COMBO'],
+  DONE: ['FLOW WITH THE', 'HARMONIC PULSE'],
+};
+
+const TUTORIAL_SHORT_HINTS_GP: Record<TutorialStep, [string, string]> = {
+  MOVE: ['STICK / D-PAD', 'GLIDE ON WALLS'],
+  SPIN: ['A/B OR LB/RB', 'CYCLE 4 COLORS'],
+  DROP: ['Y / D-DOWN', 'LOCK + SLIDE'],
   MATCH: ['MATCH 3+ DIAG', 'OR 2X2 DIAMOND'],
   ADVANCED: ['CHAIN CLEARS', 'UP TO 4X COMBO'],
   DONE: ['FLOW WITH THE', 'HARMONIC PULSE'],
@@ -90,19 +115,25 @@ export interface HudRenderOptions {
   profileHighScore: number;
   soundtest: SoundtestTelemetry | null;
   hideHudFlanks?: boolean;
+  portrait?: boolean;
+  touchOverlayVisible?: boolean;
+  beatPhase?: number; // 0..1 harmonic beat position
+  inputKind?: InputDeviceKind;
 }
 
 /**
- * Pixel-native 320x180 gameplay board and HUD renderer matching Mixolumia's exact
- * room layer stack with zero HTML overlays and strict non-overlapping flank geometry.
+ * Pixel-native gameplay board & HUD renderer supporting both canonical 320x180
+ * landscape and crisp 180x320 mobile portrait layouts with harmonic beat juice.
  */
 export class HudRenderer {
   private frameFlashAlpha = 0;
   private frameFlashSlot = 3;
+  private animTime = 0;
 
   reset(): void {
     this.frameFlashAlpha = 0;
     this.frameFlashSlot = 3;
+    this.animTime = 0;
   }
 
   /** Trigger a colored container-frame flash on clears/combos when boardColors is enabled. */
@@ -112,23 +143,13 @@ export class HudRenderer {
   }
 
   update(dtSec: number): void {
+    const dt = Math.max(0, Math.min(dtSec, 0.1));
+    this.animTime += dt;
     if (this.frameFlashAlpha > 0) {
-      this.frameFlashAlpha = Math.max(0, this.frameFlashAlpha - dtSec * 3.2);
+      this.frameFlashAlpha = Math.max(0, this.frameFlashAlpha - dt * 3.2);
     }
   }
 
-  /**
-   * Renders the full gameplay scene inside the active 320x180 WebGL2 scene pass:
-   * 1. Background BGGeometry pulses
-   * 2. Container fill (Palette Slot 1)
-   * 3. Automata Board Ripple (block_spr frame 5)
-   * 4. Settled blocks (block_spr frames 0..3 -> Palette Slots 2..5)
-   * 5. Drop Preview ghost (block_spr frame 4)
-   * 6. Active falling tetrad (interpolated unless native60Snap, with slack pulse)
-   * 7. Crisp 1px container_spr frame (flashing on clears when boardColors enabled)
-   * 8. Foreground particles & COMBO / PERFECT CLEAR banners
-   * 9. Crisp 3x5 & 5x7 HUD Flanks + NEXT corner preview + Tutorial box + Soundtest bar
-   */
   render(
     renderer: WebGL2Renderer,
     state: SimState,
@@ -138,6 +159,13 @@ export class HudRenderer {
     options: HudRenderOptions,
   ): void {
     const interp = settings.render.native60Snap ? 1 : clamp01(interpAlpha);
+    const portrait = Boolean(options.portrait);
+    const touchVisible = Boolean(options.touchOverlayVisible);
+    const beatPhase = options.beatPhase ?? 0;
+    const beatKick = settings.render.flashing ? Math.pow(clamp01(1 - beatPhase), 3) : 0;
+
+    const baseOriginX = portrait ? PORTRAIT_CONTAINER_ORIGIN_X : CONTAINER_ORIGIN_X;
+    const baseOriginY = portrait ? PORTRAIT_CONTAINER_ORIGIN_Y : CONTAINER_ORIGIN_Y;
 
     // Compute board position with optional interpolated spring shake
     const shakeX = settings.render.boardShake
@@ -146,10 +174,21 @@ export class HudRenderer {
     const shakeY = settings.render.boardShake
       ? lerp(state.prevBoardOffsetY, state.boardOffsetY, interp)
       : 0;
-    const boardX = Math.round(CONTAINER_ORIGIN_X + shakeX);
-    const boardY = Math.round(CONTAINER_ORIGIN_Y + shakeY);
+    const boardX = Math.round(baseOriginX + shakeX);
+    const boardY = Math.round(baseOriginY + shakeY);
 
-    // 1. Background layer (BGGeometry expanding pixel diamonds)
+    // 1. Background layer (BGGeometry expanding pixel diamonds + subtle beat-synced aura)
+    if (settings.render.bgShapes) {
+      const bcx = boardX + CONTAINER_WIDTH * 0.5;
+      const bcy = boardY + CONTAINER_HEIGHT * 0.5;
+      const [ar, ag, ab] = parseHexRgb01(palette.colors[state.combo >= 2 ? 3 : 2]);
+      const auraR = 68 + beatKick * 7;
+      renderer.drawDiamondOutline(bcx, bcy, auraR, ar, ag, ab, 0.1 + beatKick * 0.14);
+      if (state.combo >= 2) {
+        const [cr, cg, cb] = parseHexRgb01(palette.colors[state.combo >= 4 ? 5 : 4]);
+        renderer.drawDiamondOutline(bcx, bcy, auraR + 10, cr, cg, cb, 0.14 + beatKick * 0.16);
+      }
+    }
     renderer.effects.renderBackground(renderer, palette, settings.render, interp);
 
     // 2. Container interior fill tinted with Palette Slot 1
@@ -216,7 +255,7 @@ export class HudRenderer {
         const ghost = computeGhostPosition(state.grid, tetrad.x, tetrad.y);
         if (ghost.x !== tetrad.x || ghost.y !== tetrad.y) {
           const ghostCells = getTetradCells(ghost.x, ghost.y);
-          const ghostAlpha = clamp01(settings.gameplay.dropPreviewOpacity) * 0.55;
+          const ghostAlpha = clamp01(settings.gameplay.dropPreviewOpacity) * 0.58;
           for (let i = 0; i < 4; i++) {
             const color = tetrad.colors[i];
             const { cx, cy } = cellToContainerPixel(ghostCells[i].x, ghostCells[i].y);
@@ -273,13 +312,14 @@ export class HudRenderer {
 
     renderer.setActiveBlockCount(activeBlocks);
 
-    // 7. Crisp 1px diamond-hexagon container frame
-    if (settings.render.boardColors && this.frameFlashAlpha > 0.01) {
+    // 7. Crisp 1px diamond-hexagon container frame (harmonic beat tint + clear flash!)
+    if (settings.render.boardColors && (this.frameFlashAlpha > 0.01 || beatKick > 0.12)) {
       const [baseR, baseG, baseB] = parseHexRgb01(palette.colors[2]);
+      const flashSlot = this.frameFlashAlpha > 0.01 ? this.frameFlashSlot : 3;
       const [flashR, flashG, flashB] = parseHexRgb01(
-        palette.colors[this.frameFlashSlot] ?? palette.colors[3],
+        palette.colors[flashSlot] ?? palette.colors[3],
       );
-      const t = clamp01(this.frameFlashAlpha);
+      const t = clamp01(Math.max(this.frameFlashAlpha, beatKick * 0.28));
       renderer.drawSprite(
         'container_spr',
         0,
@@ -290,6 +330,12 @@ export class HudRenderer {
         lerp(baseB, flashB, t),
         1,
       );
+      // Beat-reactive corner glints at container apex & bottom tip
+      if (beatKick > 0.45 && settings.render.flashing) {
+        const glintHex = palette.colors[state.combo >= 2 ? 3 : 4];
+        renderer.drawRectHex(boardX + 33, boardY - 2, 2, 1, glintHex, beatKick * 0.85);
+        renderer.drawRectHex(boardX + 33, boardY + CONTAINER_HEIGHT + 1, 2, 1, glintHex, beatKick * 0.85);
+      }
     } else {
       renderer.drawSpriteHex('container_spr', 0, boardX, boardY, palette.colors[2], 1);
     }
@@ -297,55 +343,211 @@ export class HudRenderer {
     // 8. Foreground particles & floating COMBO / PERFECT CLEAR banners
     renderer.effects.renderForeground(renderer, palette, settings.render, interp);
 
-    // 9. Crisp 3x5 & 5x7 Pixel HUD Flanks + NEXT Preview + Tutorial + Soundtest
+    // 9. Crisp Pixel HUD (Portrait 180x320 or Landscape 320x180)
     if (!options.hideHudFlanks) {
-      this.renderHudFlanks(renderer, state, palette, settings, options.profileHighScore);
+      if (portrait) {
+        this.renderPortraitHud(
+          renderer,
+          state,
+          palette,
+          settings,
+          options.profileHighScore,
+          options.inputKind ?? 'touch',
+        );
+      } else {
+        this.renderLandscapeHud(
+          renderer,
+          state,
+          palette,
+          settings,
+          options.profileHighScore,
+          touchVisible,
+          options.inputKind ?? 'keyboard',
+        );
+      }
     }
 
     if (settings.gameplay.soundtestEnabled && options.soundtest) {
-      this.renderSoundtestBar(renderer, palette, options.soundtest);
+      this.renderSoundtestBar(renderer, palette, options.soundtest, portrait);
     }
   }
 
-  private renderHudFlanks(
+  private getTutorialHints(inputKind: InputDeviceKind): Record<TutorialStep, [string, string]> {
+    if (inputKind === 'touch') return TUTORIAL_SHORT_HINTS_TOUCH;
+    if (inputKind === 'gamepad') return TUTORIAL_SHORT_HINTS_GP;
+    return TUTORIAL_SHORT_HINTS_KB;
+  }
+
+  private renderPortraitHud(
     renderer: WebGL2Renderer,
     state: SimState,
     palette: Palette,
     settings: UserSettings,
     profileHighScore: number,
+    inputKind: InputDeviceKind,
+  ): void {
+    const modeConfig = GAME_MODE_CONFIGS[state.mode];
+    const primaryHex = palette.colors[2];
+    const accentHex = palette.colors[3];
+    const boardFillHex = palette.colors[1];
+
+    // Top HUD panel strip (y = 3..49) strictly clear of Pause button at (154, 5, 20x20)
+    const lx = 6;
+    const lw = 102;
+
+    // Row 1 (y=4): Mode name + Level
+    const levelStr =
+      state.mode === 'impossible'
+        ? `LV${String(state.level).padStart(2, '0')}+15`
+        : `LV ${String(state.level).padStart(2, '0')}`;
+    renderer.drawTextHex(modeConfig.name.toUpperCase(), lx, 5, accentHex, 1, '3x5', 'left');
+    renderer.drawTextHex(levelStr, lx + lw, 5, primaryHex, 0.95, '3x5', 'right');
+
+    // Row 2 (y=13..29): Score + New Best + High Score progress bar
+    const isNewBest = profileHighScore > 0 && state.score > profileHighScore;
+    renderer.drawTextHex('SCORE', lx, 13, primaryHex, 0.72, '3x5', 'left');
+    if (isNewBest) {
+      renderer.drawTextHex('NEW BEST', lx + lw, 13, accentHex, 1, '3x5', 'right');
+    } else {
+      renderer.drawTextHex(
+        `HI ${Math.max(profileHighScore, state.score).toLocaleString('en-US')}`,
+        lx + lw,
+        13,
+        primaryHex,
+        0.62,
+        '3x5',
+        'right',
+      );
+    }
+    renderer.drawTextHex(
+      state.score.toLocaleString('en-US'),
+      lx,
+      20,
+      isNewBest ? accentHex : primaryHex,
+      1,
+      '5x7',
+      'left',
+    );
+    const highScoreProgress =
+      profileHighScore > 0
+        ? clamp01(state.score / profileHighScore)
+        : state.score > 0
+          ? 1
+          : 0;
+    this.drawCrispProgressBar(renderer, lx, 29, lw, 2, highScoreProgress, boardFillHex, primaryHex, accentHex);
+
+    // Row 3 (y=35..46): Cleared + Time + Cleared progress bar
+    const clearedText =
+      modeConfig.targetBlocks !== null
+        ? `CLR ${state.cleared}/${modeConfig.targetBlocks}`
+        : `CLR ${state.cleared}`;
+    renderer.drawTextHex(clearedText, lx, 35, primaryHex, 0.95, '3x5', 'left');
+
+    const displayTicks = state.mode === 'rush' ? state.remainingTicks : state.elapsedTicks;
+    const timeStr = formatHudTime(displayTicks * SIM_DT_MS, settings.gameplay.preciseTimer);
+    const urgentRush = state.mode === 'rush' && state.remainingTicks <= 600;
+    renderer.drawTextHex(
+      timeStr,
+      lx + lw,
+      35,
+      urgentRush ? palette.colors[5] : primaryHex,
+      1,
+      '3x5',
+      'right',
+    );
+    const clearedProgress =
+      modeConfig.targetBlocks !== null
+        ? clamp01(state.cleared / modeConfig.targetBlocks)
+        : computeModeProgress(state);
+    this.drawCrispProgressBar(renderer, lx, 43, lw, 2, clearedProgress, boardFillHex, primaryHex, accentHex);
+
+    // Top-right NEXT preview card (x = 114..150, y = 5..39), leaving (154, 5, 20x20) for [||] Pause!
+    this.renderNextCardAt(renderer, state.nextColors, 114, 5, 36, 34, palette);
+
+    // Impossible forced drop pressure hairline
+    if (state.mode === 'impossible' && state.phase === 'FALLING_TETRAD') {
+      const maxTicks = Math.max(1, getImpossibleDropTimerTicks(state.impossibleDropStep));
+      const frac = clamp01(state.impossibleDropTimer / maxTicks);
+      this.drawCrispProgressBar(
+        renderer,
+        114,
+        43,
+        60,
+        2,
+        frac,
+        boardFillHex,
+        palette.colors[5],
+        palette.colors[5],
+      );
+    }
+
+    // Active Combo badge on right open flank beside the diamond board!
+    if (state.combo >= 2) {
+      const comboSlot = state.combo >= 4 ? 5 : state.combo === 3 ? 4 : 3;
+      const cx = 128;
+      const cy = 62;
+      renderer.drawRectHex(cx, cy, 46, 18, boardFillHex, 0.92);
+      this.drawBoxOutline(renderer, cx, cy, 46, 18, palette.colors[comboSlot], 1);
+      renderer.drawTextHex('COMBO', cx + 23, cy + 3, palette.colors[2], 0.85, '3x5', 'center');
+      renderer.drawTextHex(`x${state.combo}`, cx + 23, cy + 9, palette.colors[comboSlot], 1, '5x7', 'center');
+    }
+
+    // Compact horizontal Tutorial prompt strip below board (y = 186..206) when active
+    const showTutorialBox =
+      state.tutorial.enabled &&
+      (state.tutorial.step !== 'DONE' || state.tutorial.bannerTimer > 0);
+    if (showTutorialBox) {
+      this.renderPortraitTutorialStrip(renderer, state, 6, 186, PORTRAIT_LOGICAL_WIDTH - 12, palette, inputKind);
+    }
+  }
+
+  private renderLandscapeHud(
+    renderer: WebGL2Renderer,
+    state: SimState,
+    palette: Palette,
+    settings: UserSettings,
+    profileHighScore: number,
+    touchVisible: boolean,
+    inputKind: InputDeviceKind,
   ): void {
     const modeConfig = GAME_MODE_CONFIGS[state.mode];
     const modeDetails = getModeDetails(state.mode);
-    const nextLoc = settings.gameplay.nextBlockLocation;
+    // Keep NEXT in upper pockets when landscape touch controls occupy lower flanks
+    let nextLoc = settings.gameplay.nextBlockLocation;
+    if (touchVisible) {
+      if (nextLoc === 'lower_left') nextLoc = 'upper_left';
+      if (nextLoc === 'lower_right') nextLoc = 'upper_right';
+    }
 
     const primaryHex = palette.colors[2];
     const accentHex = palette.colors[3];
     const boardFillHex = palette.colors[1];
 
-    // ------------------------------------------------------------------------
-    // NEXT TETRAD 2x2 DIAMOND PREVIEW (respects all 4 corner settings)
-    // ------------------------------------------------------------------------
-    this.renderNextPreview(renderer, state.nextColors, nextLoc, palette);
+    // NEXT TETRAD 2x2 DIAMOND PREVIEW
+    this.renderNextPreview(renderer, state.nextColors, nextLoc, palette, touchVisible);
 
-    // ------------------------------------------------------------------------
-    // LEFT FLANK (x = 12..114) — dynamically shifts clear of upper_left/lower_left NEXT box
-    // ------------------------------------------------------------------------
+    // LEFT FLANK (x = 12..114)
     const leftX = 12;
-    const barW = 92;
+    const barW = touchVisible ? 96 : 92;
     let leftY = 44;
-    if (nextLoc === 'upper_left') {
+    if (touchVisible) {
+      leftY = nextLoc === 'upper_left' ? 42 : 8;
+    } else if (nextLoc === 'upper_left') {
       leftY = 58;
     } else if (nextLoc === 'lower_left') {
       leftY = 22;
     }
 
-    // CLEARED counter + crisp 1px progress bar
+    const blockStep = touchVisible ? 23 : 28;
+    const timeStep = touchVisible ? 26 : 34;
+
+    // CLEARED counter + crisp progress bar
     renderer.drawTextHex('CLEARED', leftX, leftY, primaryHex, 0.78, '3x5', 'left');
     const clearedText =
       modeConfig.targetBlocks !== null
         ? `${state.cleared}/${modeConfig.targetBlocks}`
         : `${state.cleared}`;
-    renderer.drawTextHex(clearedText, leftX, leftY + 7, primaryHex, 1, '5x7', 'left');
+    renderer.drawTextHex(clearedText, leftX, leftY + 6, primaryHex, 1, '5x7', 'left');
 
     const clearedProgress =
       modeConfig.targetBlocks !== null
@@ -354,7 +556,7 @@ export class HudRenderer {
     this.drawCrispProgressBar(
       renderer,
       leftX,
-      leftY + 17,
+      leftY + (touchVisible ? 15 : 17),
       barW,
       2,
       clearedProgress,
@@ -363,8 +565,8 @@ export class HudRenderer {
       accentHex,
     );
 
-    // SCORE counter + thin High Score progress bar underneath
-    const scoreY = leftY + 28;
+    // SCORE counter + thin High Score progress bar
+    const scoreY = leftY + blockStep;
     renderer.drawTextHex('SCORE', leftX, scoreY, primaryHex, 0.78, '3x5', 'left');
     const isNewBest = profileHighScore > 0 && state.score > profileHighScore;
     if (isNewBest) {
@@ -373,7 +575,7 @@ export class HudRenderer {
     renderer.drawTextHex(
       state.score.toLocaleString('en-US'),
       leftX,
-      scoreY + 7,
+      scoreY + 6,
       isNewBest ? accentHex : primaryHex,
       1,
       '5x7',
@@ -389,7 +591,7 @@ export class HudRenderer {
     this.drawCrispProgressBar(
       renderer,
       leftX,
-      scoreY + 17,
+      scoreY + (touchVisible ? 15 : 17),
       barW,
       2,
       highScoreProgress,
@@ -398,33 +600,35 @@ export class HudRenderer {
       accentHex,
     );
 
-    const bestLabel = `BEST ${Math.max(profileHighScore, state.score).toLocaleString('en-US')}`;
-    renderer.drawTextHex(bestLabel, leftX, scoreY + 21, primaryHex, 0.65, '3x5', 'left');
+    if (!touchVisible) {
+      const bestLabel = `BEST ${Math.max(profileHighScore, state.score).toLocaleString('en-US')}`;
+      renderer.drawTextHex(bestLabel, leftX, scoreY + 21, primaryHex, 0.65, '3x5', 'left');
+    }
 
-    // TIME readout (countdown in Rush, elapsed otherwise; MM:SS or MM:SS.mmm)
-    const timeY = scoreY + 34;
+    // TIME readout
+    const timeY = scoreY + timeStep;
     const timeLabel = state.mode === 'rush' ? 'TIME LEFT' : 'TIME';
     renderer.drawTextHex(timeLabel, leftX, timeY, primaryHex, 0.78, '3x5', 'left');
     const displayTicks = state.mode === 'rush' ? state.remainingTicks : state.elapsedTicks;
     const timeStr = formatHudTime(displayTicks * SIM_DT_MS, settings.gameplay.preciseTimer);
-    const urgentRush = state.mode === 'rush' && state.remainingTicks <= 600; // <= 10s
+    const urgentRush = state.mode === 'rush' && state.remainingTicks <= 600;
     renderer.drawTextHex(
       timeStr,
       leftX,
-      timeY + 7,
+      timeY + 6,
       urgentRush ? palette.colors[5] : primaryHex,
       1,
       '5x7',
       'left',
     );
 
-    // ------------------------------------------------------------------------
-    // RIGHT FLANK (x = 206..308) — MODE badge + LEVEL + Tutorial prompt box
-    // ------------------------------------------------------------------------
+    // RIGHT FLANK (x = 208..308)
     const rightX = 208;
-    const rightW = 100;
+    const rightW = touchVisible ? 84 : 100;
     let rightY = 26;
-    if (nextLoc === 'upper_right') {
+    if (touchVisible) {
+      rightY = nextLoc === 'upper_right' ? 44 : 10;
+    } else if (nextLoc === 'upper_right') {
       rightY = 58;
     } else if (nextLoc === 'lower_right') {
       rightY = 18;
@@ -472,12 +676,13 @@ export class HudRenderer {
       );
     }
 
-    // Active Combo badge when chaining
+    // Active Combo badge with rhythmic corner pulse chevrons when chaining
     if (state.combo >= 2) {
       const comboY = rightY + 26;
       const comboSlot = state.combo >= 4 ? 5 : state.combo === 3 ? 4 : 3;
+      const pulse = 0.72 + 0.28 * Math.sin(this.animTime * 10);
       renderer.drawRectHex(rightX, comboY, 62, 11, boardFillHex, 0.9);
-      this.drawBoxOutline(renderer, rightX, comboY, 62, 11, palette.colors[comboSlot], 1);
+      this.drawBoxOutline(renderer, rightX, comboY, 62, 11, palette.colors[comboSlot], pulse);
       renderer.drawTextHex(
         `COMBO x${state.combo}`,
         rightX + 31,
@@ -489,13 +694,15 @@ export class HudRenderer {
       );
     }
 
-    // Active Tutorial prompt box (or brief YOU GOT THIS! celebration while bannerTimer > 0)
+    // Active Tutorial prompt box (stays above touch buttons when touchVisible)
     const showTutorialBox =
       state.tutorial.enabled &&
       (state.tutorial.step !== 'DONE' || state.tutorial.bannerTimer > 0);
-    if (showTutorialBox) {
+    if (showTutorialBox && !touchVisible) {
       const tutY = nextLoc === 'lower_right' ? rightY + 40 : Math.max(rightY + 42, 98);
-      this.renderTutorialBox(renderer, state, rightX, tutY, rightW, palette);
+      this.renderTutorialBox(renderer, state, rightX, tutY, rightW, palette, inputKind);
+    } else if (showTutorialBox && touchVisible) {
+      this.renderPortraitTutorialStrip(renderer, state, 204, 62, 108, palette, inputKind);
     }
   }
 
@@ -504,18 +711,18 @@ export class HudRenderer {
     nextColors: readonly [BlockColor, BlockColor, BlockColor, BlockColor],
     location: NextBlockLocation,
     palette: Palette,
+    compact = false,
   ): void {
-    // Dedicated corner pockets strictly clear of the 68x128 container (126..194, 26..154)
     let boxX = 208;
-    let boxY = 14;
+    let boxY = compact ? 6 : 14;
     switch (location) {
       case 'upper_left':
         boxX = 76;
-        boxY = 14;
+        boxY = compact ? 6 : 14;
         break;
       case 'upper_right':
         boxX = 208;
-        boxY = 14;
+        boxY = compact ? 6 : 14;
         break;
       case 'lower_left':
         boxX = 76;
@@ -526,22 +733,29 @@ export class HudRenderer {
         boxY = 122;
         break;
     }
+    this.renderNextCardAt(renderer, nextColors, boxX, boxY, 38, 34, palette);
+  }
 
-    const boxW = 38;
-    const boxH = 34;
-
+  private renderNextCardAt(
+    renderer: WebGL2Renderer,
+    nextColors: readonly [BlockColor, BlockColor, BlockColor, BlockColor],
+    boxX: number,
+    boxY: number,
+    boxW: number,
+    boxH: number,
+    palette: Palette,
+  ): void {
     renderer.drawRectHex(boxX, boxY, boxW, boxH, palette.colors[1], 0.88);
     this.drawBoxOutline(renderer, boxX, boxY, boxW, boxH, palette.colors[2], 0.85);
     renderer.drawTextHex('NEXT', boxX + boxW * 0.5, boxY + 3, palette.colors[2], 0.85, '3x5', 'center');
 
-    // 2x2 diamond tetrad centered inside the lower area of the card
     const cx = boxX + Math.floor(boxW * 0.5);
     const cy = boxY + 20;
     const offsets: readonly [number, number][] = [
-      [0, -4], // top
-      [4, 0], // right
-      [0, 4], // bottom
-      [-4, 0], // left
+      [0, -4],
+      [4, 0],
+      [0, 4],
+      [-4, 0],
     ];
 
     for (let i = 0; i < 4; i++) {
@@ -565,6 +779,7 @@ export class HudRenderer {
     y: number,
     w: number,
     palette: Palette,
+    inputKind: InputDeviceKind,
   ): void {
     const step = state.tutorial.step;
     const progress = getTutorialProgress(state.tutorial);
@@ -573,17 +788,14 @@ export class HudRenderer {
     renderer.drawRectHex(x, y, w, h, palette.colors[1], 0.92);
     this.drawBoxOutline(renderer, x, y, w, h, palette.colors[3], 1);
 
-    // Tutorial sprite icon (16x16) on left side of card
     const iconFrame = TUTORIAL_ICON_FRAME[step];
     renderer.drawSpriteHex('tutorial_icons', iconFrame, x + 12, y + 14, palette.colors[3], 1);
 
-    // Step title (use high-contrast slot 2 ink on light palettes so yellow/orange accents stay readable)
     const title = TUTORIAL_TITLES[step];
     const titleFont = title.length > 10 ? '3x5' : '5x7';
     const titleColor = isLightPaletteBg(palette.colors[0]) ? palette.colors[2] : palette.colors[3];
     renderer.drawTextHex(title, x + 24, y + 6, titleColor, 1, titleFont, 'left');
 
-    // Step counter (e.g., 1/2)
     if (progress.target > 0) {
       renderer.drawTextHex(
         `${progress.current}/${progress.target}`,
@@ -596,12 +808,10 @@ export class HudRenderer {
       );
     }
 
-    // Crisp 2-line 3x5 hint
-    const [line1, line2] = TUTORIAL_SHORT_HINTS[step];
+    const [line1, line2] = this.getTutorialHints(inputKind)[step];
     renderer.drawTextHex(line1, x + 24, y + 17, palette.colors[2], 0.95, '3x5', 'left');
     renderer.drawTextHex(line2, x + 6, y + 27, palette.colors[2], 0.85, '3x5', 'left');
 
-    // Mini step progress bar along bottom edge
     this.drawCrispProgressBar(
       renderer,
       x + 6,
@@ -615,29 +825,78 @@ export class HudRenderer {
     );
   }
 
+  private renderPortraitTutorialStrip(
+    renderer: WebGL2Renderer,
+    state: SimState,
+    x: number,
+    y: number,
+    w: number,
+    palette: Palette,
+    inputKind: InputDeviceKind,
+  ): void {
+    const step = state.tutorial.step;
+    const progress = getTutorialProgress(state.tutorial);
+    const h = 19;
+
+    renderer.drawRectHex(x, y, w, h, palette.colors[1], 0.88);
+    this.drawBoxOutline(renderer, x, y, w, h, palette.colors[3], 0.9);
+
+    const title = TUTORIAL_TITLES[step];
+    const [line1] = this.getTutorialHints(inputKind)[step];
+    const titleColor = isLightPaletteBg(palette.colors[0]) ? palette.colors[2] : palette.colors[3];
+    renderer.drawTextHex(`${title}: ${line1}`, x + 5, y + 4, titleColor, 1, '3x5', 'left');
+    if (progress.target > 0) {
+      renderer.drawTextHex(
+        `${progress.current}/${progress.target}`,
+        x + w - 4,
+        y + 4,
+        palette.colors[2],
+        0.85,
+        '3x5',
+        'right',
+      );
+    }
+
+    this.drawCrispProgressBar(
+      renderer,
+      x + 5,
+      y + h - 5,
+      w - 10,
+      2,
+      progress.fraction,
+      palette.colors[0],
+      palette.colors[2],
+      palette.colors[3],
+    );
+  }
+
   private renderSoundtestBar(
     renderer: WebGL2Renderer,
     palette: Palette,
     telemetry: SoundtestTelemetry,
+    portrait: boolean,
   ): void {
-    // Crisp dark strip along bottom edge (y = 167..180)
-    renderer.drawRectHex(0, 167, LOGICAL_WIDTH, 13, palette.colors[0], 0.88);
-    renderer.drawRectHex(0, 167, LOGICAL_WIDTH, 1, palette.colors[1], 1);
+    const logicalW = portrait ? PORTRAIT_LOGICAL_WIDTH : LOGICAL_WIDTH;
+    const barY = portrait ? PORTRAIT_LOGICAL_HEIGHT - 13 : 167;
+
+    renderer.drawRectHex(0, barY, logicalW, 13, palette.colors[0], 0.88);
+    renderer.drawRectHex(0, barY, logicalW, 1, palette.colors[1], 1);
 
     const loopUpper = telemetry.loopName.toUpperCase();
     const nextUpper = telemetry.nextLoopName.toUpperCase();
     const bpmText = `${Math.round(telemetry.bpm)}BPM`;
-    const progText = `PROG ${telemetry.progressionStep + 1}/${Math.max(1, telemetry.progressionLength)}`;
-    const line = `LOOP: ${loopUpper} -> ${nextUpper} | ${bpmText} | ${progText}`;
+    const progText = `P${telemetry.progressionStep + 1}/${Math.max(1, telemetry.progressionLength)}`;
+    const line = portrait
+      ? `${loopUpper}->${nextUpper} ${bpmText} ${progText}`
+      : `LOOP: ${loopUpper} -> ${nextUpper} | ${bpmText} | PROG ${telemetry.progressionStep + 1}/${Math.max(1, telemetry.progressionLength)}`;
 
-    renderer.drawTextHex(line, LOGICAL_WIDTH * 0.5, 171, palette.colors[2], 1, '3x5', 'center');
+    renderer.drawTextHex(line, logicalW * 0.5, barY + 4, palette.colors[2], 1, '3x5', 'center');
 
-    // Live beat progress hairline at y = 178
-    const railX = 8;
-    const railW = LOGICAL_WIDTH - 16;
-    renderer.drawRectHex(railX, 178, railW, 1, palette.colors[1], 1);
+    const railX = 6;
+    const railW = logicalW - 12;
+    renderer.drawRectHex(railX, barY + 11, railW, 1, palette.colors[1], 1);
     const fillW = Math.max(1, Math.round(railW * clamp01(telemetry.loopProgress)));
-    renderer.drawRectHex(railX, 178, fillW, 1, palette.colors[3], 1);
+    renderer.drawRectHex(railX, barY + 11, fillW, 1, palette.colors[3], 1);
   }
 
   private drawCrispProgressBar(

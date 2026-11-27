@@ -21,7 +21,13 @@ import { HarmonicAudioEngine } from '../audio/HarmonicAudioEngine.js';
 import { getPaletteById } from '../data/palettes.js';
 import { getTracksForMode, isTrackValidForMode } from '../data/tracks.js';
 import { InputManager } from '../input/InputManager.js';
-import { DEFAULT_CONTAINER_ORIGIN_X, DEFAULT_CONTAINER_ORIGIN_Y } from '../render/ParticlesAndBg.js';
+import { detectControllerKind } from '../input/GamepadAdapter.js';
+import {
+  DEFAULT_CONTAINER_ORIGIN_X,
+  DEFAULT_CONTAINER_ORIGIN_Y,
+  PORTRAIT_CONTAINER_ORIGIN_X,
+  PORTRAIT_CONTAINER_ORIGIN_Y,
+} from '../render/ParticlesAndBg.js';
 import { WebGL2Renderer } from '../render/WebGL2Renderer.js';
 import {
   clearPlayableGrid,
@@ -36,6 +42,7 @@ import {
 } from '../sim/index.js';
 import { HudRenderer } from '../ui/HudRenderer.js';
 import { MenuScreens, type MenuScreenCallbacks, type MenuScreenContext } from '../ui/MenuScreens.js';
+import { TouchOverlayRenderer } from '../ui/TouchOverlayRenderer.js';
 import { DebugDrawer } from './DebugDrawer.js';
 import { SaveManager, type RunRecordOutcome, type SettingsUpdatePatch } from './SaveManager.js';
 
@@ -67,8 +74,11 @@ export class GameApp {
   private readonly saveManager: SaveManager;
   private readonly hudRenderer: HudRenderer;
   private readonly menuScreens: MenuScreens;
+  private readonly touchOverlayRenderer: TouchOverlayRenderer;
   private readonly debugBridge: DebugBridge;
   private readonly debugDrawer: DebugDrawer;
+
+  private lastPortraitActive = false;
 
   private screen: AppScreen;
   private settingsReturnScreen: AppScreen = 'TITLE';
@@ -106,8 +116,10 @@ export class GameApp {
       initialSettings.audio.muted,
     );
     this.inputManager = new InputManager(canvas, () => this.renderer.getViewportTransform());
+    this.inputManager.setOnAudioUnlock(this.handleAudioUnlockGesture);
     this.hudRenderer = new HudRenderer();
     this.menuScreens = new MenuScreens();
+    this.touchOverlayRenderer = new TouchOverlayRenderer();
 
     this.selectedMode = initialData.lastMode;
     this.selectedTrack = isTrackValidForMode(initialData.lastTrack, this.selectedMode)
@@ -213,7 +225,7 @@ export class GameApp {
         return null;
       },
       onApplyControlBindings: ({ keyboard, gamepad }) => {
-        this.applySettingsPatch({ keyboard, gamepad });
+        this.applySettingsPatch({ keyboard, gamepad, gamepadCustomized: true });
       },
       onPlayMenuMove: () => this.audioEngine.menu.playMove(),
       onPlayMenuSelect: () => {
@@ -263,8 +275,13 @@ export class GameApp {
     this.handleResize();
     if (typeof window !== 'undefined') {
       window.addEventListener('resize', this.handleResize);
+      window.addEventListener('orientationchange', this.handleResize);
+      window.visualViewport?.addEventListener('resize', this.handleResize);
       window.addEventListener('keydown', this.handleGlobalKeyDown);
       window.addEventListener('pointerdown', this.handleAudioUnlockGesture);
+      window.addEventListener('touchstart', this.handleAudioUnlockGesture, { passive: true });
+      window.addEventListener('gamepadconnected', this.handleGamepadConnected);
+      window.addEventListener('gamepaddisconnected', this.handleGamepadDisconnected);
     }
 
     this.menuScreens.onEnterScreen(this.screen, this.buildMenuContext());
@@ -285,8 +302,13 @@ export class GameApp {
     }
     if (typeof window !== 'undefined') {
       window.removeEventListener('resize', this.handleResize);
+      window.removeEventListener('orientationchange', this.handleResize);
+      window.visualViewport?.removeEventListener('resize', this.handleResize);
       window.removeEventListener('keydown', this.handleGlobalKeyDown);
       window.removeEventListener('pointerdown', this.handleAudioUnlockGesture);
+      window.removeEventListener('touchstart', this.handleAudioUnlockGesture);
+      window.removeEventListener('gamepadconnected', this.handleGamepadConnected);
+      window.removeEventListener('gamepaddisconnected', this.handleGamepadDisconnected);
       if (window.__KRUNKED_DEBUG__ === this.debugBridge) {
         delete window.__KRUNKED_DEBUG__;
       }
@@ -502,12 +524,15 @@ export class GameApp {
     if (events.length === 0) return;
 
     const settings = this.saveManager.getSettings();
+    const portrait = this.computeIsPortraitGameplay();
+    const originX = portrait ? PORTRAIT_CONTAINER_ORIGIN_X : DEFAULT_CONTAINER_ORIGIN_X;
+    const originY = portrait ? PORTRAIT_CONTAINER_ORIGIN_Y : DEFAULT_CONTAINER_ORIGIN_Y;
 
     // 1. Visual effects (particles, BGGeometry waves, floating pixel banners, bloom & flash)
     const fx = this.renderer.effects.consumeSimEvents(
       events,
-      DEFAULT_CONTAINER_ORIGIN_X,
-      DEFAULT_CONTAINER_ORIGIN_Y,
+      originX,
+      originY,
     );
     if (fx.bloomPulse > 0) {
       this.renderer.triggerBloomPulse(fx.bloomPulse);
@@ -581,8 +606,12 @@ export class GameApp {
     this.audioEngine.update(dtSec);
 
     // 2. Poll UI input & run fixed-timestep 60Hz sim when PLAYING
+    const portraitNow = this.computeIsPortraitGameplay();
+    const touchAllowedNow = this.isTouchControlsVisible() || portraitNow;
+    this.inputManager.setGameplayContext(this.screen === 'PLAYING', portraitNow, touchAllowedNow);
+
     if (this.screen === 'PLAYING' && this.simState) {
-      const uiInput = this.inputManager.pollUiInput(settings);
+      const uiInput = this.inputManager.pollUiInput(settings, dtSec);
       if (uiInput.pause) {
         this.audioEngine.menu.playBack();
         this.screen = 'PAUSED';
@@ -598,10 +627,11 @@ export class GameApp {
           ticksThisFrame += 1;
         }
         this.hudRenderer.update(dtSec);
+        this.inputManager.updateTouchVisuals(dtSec, portraitNow);
       }
     } else {
       this.simAccumulatorMs = 0;
-      const uiInput = this.inputManager.pollUiInput(settings);
+      const uiInput = this.inputManager.pollUiInput(settings, dtSec);
       const ctx = this.buildMenuContext();
       this.anyKeyLatched = false;
       this.menuScreens.update(dtSec, uiInput, ctx, this.menuCallbacks, this.inputManager);
@@ -640,10 +670,71 @@ export class GameApp {
   private lastViewportCssH = 0;
   private lastViewportDpr = 0;
 
+  private readSafeAreaInsets(): { top: number; right: number; bottom: number; left: number } {
+    if (typeof window === 'undefined' || typeof getComputedStyle !== 'function') {
+      return { top: 0, right: 0, bottom: 0, left: 0 };
+    }
+    try {
+      const style = getComputedStyle(document.documentElement);
+      const parsePx = (prop: string): number => {
+        const val = Number.parseFloat(style.getPropertyValue(prop));
+        return Number.isFinite(val) && val > 0 ? val : 0;
+      };
+      return {
+        top: parsePx('--sat'),
+        right: parsePx('--sar'),
+        bottom: parsePx('--sab'),
+        left: parsePx('--sal'),
+      };
+    } catch {
+      return { top: 0, right: 0, bottom: 0, left: 0 };
+    }
+  }
+
+  private computeIsPortraitGameplay(): boolean {
+    const isGameplayBacked =
+      (this.screen === 'PLAYING' || this.screen === 'PAUSED' || this.screen === 'ENDGAME') &&
+      this.simState !== null;
+    if (!isGameplayBacked) {
+      return false;
+    }
+    const render = this.saveManager.getSettings().render;
+    if (render.tateRotate) {
+      return false;
+    }
+    const mode = render.portraitMode ?? 'auto';
+    if (mode === 'on') {
+      this.lastPortraitActive = true;
+      return true;
+    }
+    if (mode === 'off') {
+      this.lastPortraitActive = false;
+      return false;
+    }
+    const cssW = this.lastViewportCssW || this.canvas.clientWidth || (typeof window !== 'undefined' ? window.innerWidth : 320);
+    const cssH = this.lastViewportCssH || this.canvas.clientHeight || (typeof window !== 'undefined' ? window.innerHeight : 180);
+    if (this.lastPortraitActive) {
+      if (cssW > cssH * 1.05) {
+        this.lastPortraitActive = false;
+      }
+    } else if (cssH > cssW * 1.05) {
+      this.lastPortraitActive = true;
+    }
+    return this.lastPortraitActive;
+  }
+
+  private isTouchControlsVisible(): boolean {
+    const mode = this.saveManager.getSettings().gameplay.touchControlsMode ?? 'auto';
+    if (mode === 'on') return true;
+    if (mode === 'off') return false;
+    return this.inputManager.isTouchSensed();
+  }
+
   private syncCanvasViewport(): void {
     if (typeof window === 'undefined') return;
-    const cssW = this.canvas.clientWidth > 0 ? this.canvas.clientWidth : window.innerWidth;
-    const cssH = this.canvas.clientHeight > 0 ? this.canvas.clientHeight : window.innerHeight;
+    const vv = window.visualViewport;
+    const cssW = this.canvas.clientWidth > 0 ? this.canvas.clientWidth : (vv?.width ?? window.innerWidth);
+    const cssH = this.canvas.clientHeight > 0 ? this.canvas.clientHeight : (vv?.height ?? window.innerHeight);
     const dpr = window.devicePixelRatio || 1;
     if (
       cssW !== this.lastViewportCssW ||
@@ -653,6 +744,7 @@ export class GameApp {
       this.lastViewportCssW = cssW;
       this.lastViewportCssH = cssH;
       this.lastViewportDpr = dpr;
+      this.renderer.setSafeAreaInsets(this.readSafeAreaInsets());
       this.renderer.resize(cssW, cssH, dpr);
     }
   }
@@ -662,32 +754,51 @@ export class GameApp {
     const settings = this.saveManager.getSettings();
     const palette = this.getActivePalette();
     const profile = this.saveManager.getActiveProfile();
+    const portrait = this.computeIsPortraitGameplay();
+    const touchOverlayVisible = this.screen === 'PLAYING' && this.isTouchControlsVisible();
 
-    this.renderer.beginScene(palette);
+    this.renderer.beginScene(palette, portrait);
 
     const isGameplayBacked =
       (this.screen === 'PLAYING' || this.screen === 'PAUSED' || this.screen === 'ENDGAME') &&
       this.simState !== null;
 
     if (isGameplayBacked && this.simState) {
-      const soundtest = settings.gameplay.soundtestEnabled
+      const liveTelemetry = this.audioEngine.isPlaying()
         ? this.audioEngine.getSoundtestTelemetry()
         : null;
+      const soundtest = settings.gameplay.soundtestEnabled ? liveTelemetry : null;
+      const beatPhase = liveTelemetry ? (liveTelemetry.loopProgress * Math.max(1, liveTelemetry.progressionLength)) % 1 : 0;
+
       this.hudRenderer.render(this.renderer, this.simState, palette, settings, interpAlpha, {
         profileHighScore: profile.highScores[this.simState.mode] ?? 0,
         soundtest,
         hideHudFlanks: this.screen === 'ENDGAME',
+        portrait,
+        touchOverlayVisible,
+        beatPhase,
+        inputKind: this.inputManager.getLastInputKind(),
       });
+
+      if (this.screen === 'PLAYING' && (touchOverlayVisible || portrait)) {
+        this.touchOverlayRenderer.render(
+          this.renderer,
+          this.inputManager.getTouchVisualState(portrait),
+          palette,
+          settings.gameplay.touchOpacity ?? 0.55,
+          touchOverlayVisible,
+        );
+      }
     }
 
     if (this.screen !== 'PLAYING') {
       this.menuScreens.render(this.renderer, this.buildMenuContext());
     }
 
-    // Board Zoom applies strictly during gameplay so menus/settings/editors are never clipped
-    const effectiveRenderSettings = isGameplayBacked
-      ? settings.render
-      : { ...settings.render, boardZoom: false };
+    // Board Zoom applies strictly during non-portrait, non-touch active PLAYING so HUD/controls never clip
+    const allowBoardZoom =
+      this.screen === 'PLAYING' && !portrait && !touchOverlayVisible && settings.render.boardZoom;
+    const effectiveRenderSettings = { ...settings.render, boardZoom: allowBoardZoom };
 
     this.renderer.endSceneAndPresent(palette, effectiveRenderSettings, dtSec);
   }
@@ -701,6 +812,7 @@ export class GameApp {
       this.customPackCallbacks.getCustomPackStatusLabel?.() ??
       (settings.packMode === 'custom' ? 'PACK: CUSTOM' : 'PACK: BUILT-IN');
 
+    const gpStatus = this.inputManager.getControllerStatus();
     return {
       screen: this.screen,
       palette,
@@ -718,6 +830,9 @@ export class GameApp {
       hasCustomPackLoader: typeof this.customPackCallbacks.onRequestLoadCustomPack === 'function',
       settingsReturnScreen: this.settingsReturnScreen,
       anyKeyPressed: this.anyKeyLatched,
+      isPortraitGameplay: this.computeIsPortraitGameplay(),
+      controllerKind: gpStatus.controllerKind,
+      connectedGamepads: gpStatus.connectedCount,
     };
   }
 
@@ -728,10 +843,36 @@ export class GameApp {
   private readonly handleResize = (): void => {
     if (typeof window === 'undefined') return;
     const rect = this.canvas.getBoundingClientRect();
-    const cssW = rect.width > 0 ? rect.width : window.innerWidth;
-    const cssH = rect.height > 0 ? rect.height : window.innerHeight;
+    const vv = window.visualViewport;
+    const cssW = rect.width > 0 ? rect.width : (vv?.width ?? window.innerWidth);
+    const cssH = rect.height > 0 ? rect.height : (vv?.height ?? window.innerHeight);
     const dpr = window.devicePixelRatio || 1;
+    this.lastViewportCssW = cssW;
+    this.lastViewportCssH = cssH;
+    this.lastViewportDpr = dpr;
+    this.renderer.setSafeAreaInsets(this.readSafeAreaInsets());
     this.renderer.resize(cssW, cssH, dpr);
+  };
+
+  private readonly handleGamepadConnected = (e: Event): void => {
+    const gpEvent = e as GamepadEvent;
+    const id = gpEvent.gamepad?.id ?? '';
+    const kind = detectControllerKind(id);
+    const label =
+      kind === 'xbox'
+        ? 'XBOX CONTROLLER CONNECTED'
+        : kind === 'tesla'
+          ? 'TESLA CONTROLLER CONNECTED'
+          : kind === 'playstation'
+            ? 'PLAYSTATION PAD CONNECTED'
+            : kind === 'nintendo'
+              ? 'NINTENDO PAD CONNECTED'
+              : 'CONTROLLER CONNECTED';
+    this.menuScreens.showToast(label, 2.4);
+  };
+
+  private readonly handleGamepadDisconnected = (): void => {
+    this.menuScreens.showToast('CONTROLLER DISCONNECTED', 2.0);
   };
 
   private readonly handleAudioUnlockGesture = (): void => {
@@ -811,6 +952,10 @@ export class GameApp {
           soundtest: this.audioEngine.isPlaying() ? this.audioEngine.getSoundtestTelemetry() : null,
           settings,
           profile,
+          isPortraitGameplay: this.computeIsPortraitGameplay(),
+          touchControlsVisible: this.screen === 'PLAYING' && this.isTouchControlsVisible(),
+          controllerKind: this.inputManager.getControllerStatus().controllerKind,
+          connectedGamepads: this.inputManager.getControllerStatus().connectedCount,
         };
       },
 

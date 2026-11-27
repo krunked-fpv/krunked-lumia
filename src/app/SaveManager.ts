@@ -20,10 +20,12 @@ import {
   type Palette,
   type PaletteColors,
   type PlayerProfile,
+  type PortraitMode,
   type ProfileStats,
   type SaveData,
   type SimState,
   type TargetFps,
+  type TouchControlsMode,
   type TrackId,
   type UserSettings,
 } from '../contracts/index.js';
@@ -33,7 +35,10 @@ import {
 } from '../data/palettes.js';
 import {
   ACTION_VERBS,
+  DEFAULT_TOUCH_OPACITY,
   NEXT_BLOCK_LOCATIONS,
+  PORTRAIT_MODES,
+  TOUCH_CONTROLS_MODES,
   createDefaultAudioSettings,
   createDefaultGamepadBindings,
   createDefaultGameplaySettings,
@@ -89,6 +94,7 @@ export interface SettingsUpdatePatch {
   audio?: Partial<UserSettings['audio']>;
   keyboard?: Partial<KeyboardBindings>;
   gamepad?: Partial<GamepadBindings>;
+  gamepadCustomized?: boolean;
   packMode?: PackMode;
   photosensitivitySeen?: boolean;
 }
@@ -106,6 +112,8 @@ const VALID_MODE_SET = new Set<string>(GAME_MODE_ORDER);
 const VALID_TRACK_SET = new Set<string>(ALL_TRACK_IDS);
 const VALID_FPS_SET = new Set<number>(TARGET_FPS_OPTIONS);
 const VALID_NEXT_LOC_SET = new Set<string>(NEXT_BLOCK_LOCATIONS);
+const VALID_PORTRAIT_MODE_SET = new Set<string>(PORTRAIT_MODES);
+const VALID_TOUCH_MODE_SET = new Set<string>(TOUCH_CONTROLS_MODES);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -379,7 +387,15 @@ function sanitizeKeyboardBindings(raw: unknown): KeyboardBindings {
   return out;
 }
 
-function sanitizeGamepadBindings(raw: unknown): GamepadBindings {
+function arraysEqualNumbers(a: readonly number[], b: readonly number[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+function sanitizeGamepadBindings(raw: unknown, gamepadCustomized: boolean): GamepadBindings {
   const def = createDefaultGamepadBindings();
   if (!isRecord(raw)) {
     return def;
@@ -399,6 +415,20 @@ function sanitizeGamepadBindings(raw: unknown): GamepadBindings {
       out[verb] = [...def[verb]];
     }
   }
+
+  // Upgrade untouched legacy v1 defaults to include LT (6), RT (7), and View (8)
+  if (!gamepadCustomized) {
+    if (arraysEqualNumbers(out.spinLeft, [1, 2, 4])) {
+      out.spinLeft = [...def.spinLeft];
+    }
+    if (arraysEqualNumbers(out.spinRight, [0, 5])) {
+      out.spinRight = [...def.spinRight];
+    }
+    if (arraysEqualNumbers(out.pause, [9])) {
+      out.pause = [...def.pause];
+    }
+  }
+
   return out;
 }
 
@@ -414,6 +444,10 @@ function sanitizeSettings(raw: unknown, validPaletteIds: ReadonlySet<string>): U
     typeof rawRender.targetFps === 'number' && VALID_FPS_SET.has(rawRender.targetFps)
       ? (rawRender.targetFps as TargetFps)
       : defRender.targetFps;
+  const portraitMode: PortraitMode =
+    typeof rawRender.portraitMode === 'string' && VALID_PORTRAIT_MODE_SET.has(rawRender.portraitMode)
+      ? (rawRender.portraitMode as PortraitMode)
+      : (defRender.portraitMode ?? 'auto');
 
   const rawGameplay = isRecord(raw.gameplay) ? raw.gameplay : {};
   const defGameplay = createDefaultGameplaySettings();
@@ -422,6 +456,11 @@ function sanitizeSettings(raw: unknown, validPaletteIds: ReadonlySet<string>): U
     VALID_NEXT_LOC_SET.has(rawGameplay.nextBlockLocation)
       ? (rawGameplay.nextBlockLocation as NextBlockLocation)
       : defGameplay.nextBlockLocation;
+  const touchControlsMode: TouchControlsMode =
+    typeof rawGameplay.touchControlsMode === 'string' &&
+    VALID_TOUCH_MODE_SET.has(rawGameplay.touchControlsMode)
+      ? (rawGameplay.touchControlsMode as TouchControlsMode)
+      : (defGameplay.touchControlsMode ?? 'auto');
 
   const rawAudio = isRecord(raw.audio) ? raw.audio : {};
   const defAudio = createDefaultAudioSettings();
@@ -433,6 +472,7 @@ function sanitizeSettings(raw: unknown, validPaletteIds: ReadonlySet<string>): U
 
   const packMode: PackMode =
     raw.packMode === 'custom' || raw.packMode === 'builtin' ? raw.packMode : def.packMode;
+  const gamepadCustomized = sanitizeBool(raw.gamepadCustomized, false);
 
   return {
     paletteId,
@@ -448,6 +488,7 @@ function sanitizeSettings(raw: unknown, validPaletteIds: ReadonlySet<string>): U
       boardColors: sanitizeBool(rawRender.boardColors, defRender.boardColors),
       boardZoom: sanitizeBool(rawRender.boardZoom, defRender.boardZoom),
       tateRotate: sanitizeBool(rawRender.tateRotate, defRender.tateRotate),
+      portraitMode,
     },
     gameplay: {
       dropPreviewOpacity: sanitizeClampedFloat(
@@ -469,13 +510,21 @@ function sanitizeSettings(raw: unknown, validPaletteIds: ReadonlySet<string>): U
       gamepadRumble: sanitizeBool(rawGameplay.gamepadRumble, defGameplay.gamepadRumble),
       tutorialEnabled: sanitizeBool(rawGameplay.tutorialEnabled, defGameplay.tutorialEnabled),
       soundtestEnabled: sanitizeBool(rawGameplay.soundtestEnabled, defGameplay.soundtestEnabled),
+      touchControlsMode,
+      touchOpacity: sanitizeClampedFloat(
+        rawGameplay.touchOpacity,
+        0.25,
+        0.95,
+        defGameplay.touchOpacity ?? DEFAULT_TOUCH_OPACITY,
+      ),
     },
     audio: {
       masterVolume: sanitizeClampedFloat(rawAudio.masterVolume, 0, 1, defAudio.masterVolume),
       muted: sanitizeBool(rawAudio.muted, defAudio.muted),
     },
     keyboard: sanitizeKeyboardBindings(raw.keyboard),
-    gamepad: sanitizeGamepadBindings(raw.gamepad),
+    gamepad: sanitizeGamepadBindings(raw.gamepad, gamepadCustomized),
+    gamepadCustomized,
     packMode,
     photosensitivitySeen: sanitizeBool(raw.photosensitivitySeen, def.photosensitivitySeen),
   };

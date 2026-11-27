@@ -2,6 +2,7 @@ import {
   LOGICAL_HEIGHT,
   LOGICAL_WIDTH,
   type ActionVerb,
+  type ControllerKind,
   type InputFrame,
   type UserSettings,
 } from '../contracts/index.js';
@@ -10,12 +11,19 @@ import {
   computeLetterboxRect,
   type ViewportTransform,
 } from '../render/WebGL2Renderer.js';
+import {
+  GamepadAdapter,
+  type GamepadPollResult,
+  type GamepadSnapshot,
+} from './GamepadAdapter.js';
+import { TouchController, type TouchVisualState } from './TouchController.js';
 
 export type InputCaptureResult =
   | { type: 'keyboard'; code: string }
   | { type: 'gamepad'; button: number };
 
 export type InputCaptureCallback = (result: InputCaptureResult) => void;
+export type InputDeviceKind = 'keyboard' | 'mouse' | 'touch' | 'gamepad';
 
 export interface UiInputState {
   up: boolean;
@@ -37,6 +45,9 @@ export interface UiInputState {
   mouseClicked: boolean;
   mouseMoved: boolean;
   usingGamepad: boolean;
+  isTouchPointer?: boolean;
+  scrollDelta?: number;
+  anyGamepadPressed?: boolean;
 }
 
 export interface ClientRectLike {
@@ -54,11 +65,9 @@ const PREVENT_SCROLL_CODES = new Set<string>([
   'Space',
 ]);
 
-const STICK_DEADZONE = 0.45;
-const GP_DPAD_UP = 12;
-const GP_DPAD_DOWN = 13;
-const GP_DPAD_LEFT = 14;
-const GP_DPAD_RIGHT = 15;
+const MENU_REPEAT_DELAY_SEC = 0.28;
+const MENU_REPEAT_RATE_SEC = 0.095;
+const TOUCH_MENU_SCROLL_THRESHOLD_PX = 8;
 
 const FALLBACK_KB: Record<ActionVerb, readonly string[]> = {
   up: ['ArrowUp', 'KeyW'],
@@ -84,15 +93,16 @@ const FALLBACK_GP: Record<ActionVerb, readonly number[]> = {
   cancel: [1],
   moveLeft: [14],
   moveRight: [15],
-  hardDrop: [13],
-  spinLeft: [2, 4],
-  spinRight: [0, 5],
-  pause: [9],
+  hardDrop: [13, 3],
+  spinLeft: [1, 2, 4, 6],
+  spinRight: [0, 5, 7],
+  pause: [9, 8],
 };
 
 /**
- * Maps browser client pointer coordinates into exact logical 320x180 pixels,
- * accounting for aspect-ratio letterboxing, 90-degree CW Tate rotation, and Board Zoom.
+ * Maps browser client pointer coordinates into exact logical pixels (320x180 landscape or
+ * 180x320 portrait), accounting for aspect-ratio letterboxing, 90-degree CW Tate rotation,
+ * and Board Zoom.
  */
 export function mapClientToLogical(
   clientX: number,
@@ -100,6 +110,9 @@ export function mapClientToLogical(
   canvasRect: ClientRectLike,
   transform: ViewportTransform,
 ): { x: number; y: number; inBounds: boolean } {
+  const logicalW = transform.logicalWidth ?? LOGICAL_WIDTH;
+  const logicalH = transform.logicalHeight ?? LOGICAL_HEIGHT;
+
   const localX = clientX - canvasRect.left;
   const localY = clientY - canvasRect.top;
   const viewW = Math.max(1, transform.viewW);
@@ -122,9 +135,9 @@ export function mapClientToLogical(
     v = (v - 0.5) / BOARD_ZOOM_FACTOR + 0.5;
   }
 
-  const x = u * LOGICAL_WIDTH;
-  const y = (1 - v) * LOGICAL_HEIGHT;
-  const inBounds = inViewport && x >= 0 && x <= LOGICAL_WIDTH && y >= 0 && y <= LOGICAL_HEIGHT;
+  const x = u * logicalW;
+  const y = (1 - v) * logicalH;
+  const inBounds = inViewport && x >= 0 && x <= logicalW && y >= 0 && y <= logicalH;
   return { x, y, inBounds };
 }
 
@@ -139,36 +152,73 @@ function isEditableTarget(target: EventTarget | null): boolean {
   return tag === 'INPUT' || tag === 'TEXTAREA' || target.isContentEditable;
 }
 
+type RepeatDir = 'up' | 'down' | 'left' | 'right';
+
 /**
- * Unified Keyboard, Mouse (logical 320x180 mapped), and Gamepad Input Manager.
- * Separates UI edge latches from 60 Hz Simulation edge latches so neither steals presses
- * at 30/60/120 FPS, and supports live key/gamepad capture for Controls Remapping.
+ * Unified Keyboard, Mouse, Multi-Touch (Virtual Stick + Buttons + Menu Swipe/Drag),
+ * and Full Xbox/Tesla/W3C Gamepad Input Manager.
  */
 export class InputManager {
   private canvas: HTMLCanvasElement | null = null;
   private viewportProvider: (() => ViewportTransform) | null = null;
   private attached = false;
 
+  private readonly gamepadAdapter = new GamepadAdapter();
+  private readonly touchController = new TouchController();
+
   // Keyboard state
   private readonly heldKeys = new Set<string>();
   private readonly uiPressedKeys = new Set<string>();
   private readonly simPressedKeys = new Set<string>();
 
-  // Gamepad state
-  private readonly heldGpButtons = new Set<number>();
+  // Gamepad state (separate UI & Sim canonical button sets)
+  private readonly heldUiGpButtons = new Set<number>();
+  private readonly heldSimGpButtons = new Set<number>();
   private readonly prevUiGpButtons = new Set<number>();
   private readonly prevSimGpButtons = new Set<number>();
+  private gpRightStickSpinLeft = false;
+  private gpRightStickSpinRight = false;
+  private gpAnyNewButtonPressed = false;
+  private lastGamepadPoll: GamepadPollResult | null = null;
 
-  // Mouse state in logical 320x180 coordinates
+  // Pointer / Mouse / Menu-Touch state in logical coordinates
   private mouseX = LOGICAL_WIDTH * 0.5;
   private mouseY = LOGICAL_HEIGHT * 0.5;
   private mouseInBounds = false;
   private mouseDown = false;
   private mouseClicked = false;
   private mouseMoved = false;
+  private isTouchPointer = false;
+  private scrollDelta = 0;
 
+  // Menu touch tap-vs-scroll gesture tracker
+  private menuTouchPointerId: number | null = null;
+  private menuTouchStartX = 0;
+  private menuTouchStartY = 0;
+  private menuTouchLastY = 0;
+  private menuTouchDraggingScroll = false;
+  private menuTouchDraggingHorizontal = false;
+  private menuTouchInBounds = false;
+
+  // Gameplay touch routing mode
+  private gameplayActive = false;
+  private gameplayPortrait = false;
+  private touchControlsAllowed = true;
+
+  // Active device sensing
   private usingGamepad = false;
+  private touchSensed = false;
+  private lastInputKind: InputDeviceKind = 'keyboard';
   private captureCallback: InputCaptureCallback | null = null;
+  private onAudioUnlockCallback: (() => void) | null = null;
+
+  // Menu directional auto-repeat timers
+  private readonly repeatTimers: Record<RepeatDir, { held: boolean; elapsed: number; repeating: boolean }> = {
+    up: { held: false, elapsed: 0, repeating: false },
+    down: { held: false, elapsed: 0, repeating: false },
+    left: { held: false, elapsed: 0, repeating: false },
+    right: { held: false, elapsed: 0, repeating: false },
+  };
 
   constructor(
     canvas?: HTMLCanvasElement | null,
@@ -186,6 +236,46 @@ export class InputManager {
     this.viewportProvider = provider;
   }
 
+  setOnAudioUnlock(callback: (() => void) | null): void {
+    this.onAudioUnlockCallback = callback;
+  }
+
+  setGameplayContext(active: boolean, portrait: boolean, touchControlsAllowed = true): void {
+    const layoutChanged = this.gameplayPortrait !== portrait || this.gameplayActive !== active;
+    this.gameplayActive = active;
+    this.gameplayPortrait = portrait;
+    this.touchControlsAllowed = touchControlsAllowed;
+    if (layoutChanged) {
+      this.touchController.reset(portrait);
+      this.resetMenuTouchGesture();
+    }
+  }
+
+  isTouchSensed(): boolean {
+    return this.touchSensed;
+  }
+
+  getLastInputKind(): InputDeviceKind {
+    return this.lastInputKind;
+  }
+
+  getTouchVisualState(portrait: boolean): TouchVisualState {
+    return this.touchController.getVisualState(portrait);
+  }
+
+  updateTouchVisuals(dtSec: number, portrait: boolean): void {
+    this.touchController.updateVisuals(dtSec, portrait);
+  }
+
+  getControllerStatus(): {
+    connectedCount: number;
+    activePadIndex: number | null;
+    activePadId: string | null;
+    controllerKind: ControllerKind | null;
+  } {
+    return this.gamepadAdapter.getStatus();
+  }
+
   attach(canvas: HTMLCanvasElement, viewportProvider?: () => ViewportTransform): void {
     if (this.attached) {
       this.detach();
@@ -197,12 +287,25 @@ export class InputManager {
     if (typeof window === 'undefined') {
       return;
     }
+    // Coarse-pointer heuristic (mobile phones/tablets) primes touch sensing immediately
+    if (
+      typeof window.matchMedia === 'function' &&
+      (window.matchMedia('(pointer: coarse)').matches || (navigator.maxTouchPoints ?? 0) > 0)
+    ) {
+      this.touchSensed = true;
+      this.lastInputKind = 'touch';
+    }
+
     window.addEventListener('keydown', this.onKeyDown, { passive: false });
     window.addEventListener('keyup', this.onKeyUp);
     window.addEventListener('blur', this.onBlur);
     canvas.addEventListener('pointermove', this.onPointerMove);
     canvas.addEventListener('pointerdown', this.onPointerDown);
+    canvas.addEventListener('pointercancel', this.onPointerCancel);
+    canvas.addEventListener('lostpointercapture', this.onPointerCancel);
+    canvas.addEventListener('wheel', this.onWheel, { passive: false });
     window.addEventListener('pointerup', this.onPointerUp);
+    window.addEventListener('pointercancel', this.onPointerCancel);
     this.attached = true;
   }
 
@@ -217,14 +320,21 @@ export class InputManager {
     if (this.canvas) {
       this.canvas.removeEventListener('pointermove', this.onPointerMove);
       this.canvas.removeEventListener('pointerdown', this.onPointerDown);
+      this.canvas.removeEventListener('pointercancel', this.onPointerCancel);
+      this.canvas.removeEventListener('lostpointercapture', this.onPointerCancel);
+      this.canvas.removeEventListener('wheel', this.onWheel);
     }
     window.removeEventListener('pointerup', this.onPointerUp);
+    window.removeEventListener('pointercancel', this.onPointerCancel);
     this.attached = false;
   }
 
   dispose(): void {
     this.detach();
     this.captureCallback = null;
+    this.onAudioUnlockCallback = null;
+    this.touchController.reset();
+    this.gamepadAdapter.reset();
   }
 
   clearEdges(): void {
@@ -232,12 +342,36 @@ export class InputManager {
     this.simPressedKeys.clear();
     this.mouseClicked = false;
     this.mouseMoved = false;
+    this.scrollDelta = 0;
+    this.gpRightStickSpinLeft = false;
+    this.gpRightStickSpinRight = false;
+    this.gpAnyNewButtonPressed = false;
+    this.touchController.clearEdges();
     this.prevUiGpButtons.clear();
     this.prevSimGpButtons.clear();
-    for (const btn of this.heldGpButtons) {
+    for (const btn of this.heldUiGpButtons) {
       this.prevUiGpButtons.add(btn);
+    }
+    for (const btn of this.heldSimGpButtons) {
       this.prevSimGpButtons.add(btn);
     }
+    this.resetRepeatTimers();
+  }
+
+  private resetRepeatTimers(): void {
+    for (const dir of ['up', 'down', 'left', 'right'] as const) {
+      this.repeatTimers[dir].held = false;
+      this.repeatTimers[dir].elapsed = 0;
+      this.repeatTimers[dir].repeating = false;
+    }
+  }
+
+  private resetMenuTouchGesture(): void {
+    this.menuTouchPointerId = null;
+    this.menuTouchDraggingScroll = false;
+    this.menuTouchDraggingHorizontal = false;
+    this.menuTouchInBounds = false;
+    this.mouseDown = false;
   }
 
   startCapture(callback: InputCaptureCallback): void {
@@ -270,12 +404,14 @@ export class InputManager {
       }
       this.heldKeys.add(code);
       this.usingGamepad = false;
+      this.touchSensed = false;
+      this.lastInputKind = 'keyboard';
     } else {
       this.heldKeys.delete(code);
     }
   }
 
-  /** Test/debug helper to inject logical 320x180 pointer state directly. */
+  /** Test/debug helper to inject logical pointer state directly. */
   injectMouse(logicalX: number, logicalY: number, down = false, clicked = false): void {
     this.mouseX = logicalX;
     this.mouseY = logicalY;
@@ -286,7 +422,43 @@ export class InputManager {
       this.mouseClicked = true;
     }
     this.mouseMoved = true;
+    this.isTouchPointer = false;
     this.usingGamepad = false;
+    this.lastInputKind = 'mouse';
+  }
+
+  /** Test/debug helper to drive menu touch tap-vs-scroll disambiguation without DOM. */
+  injectTouchMenuPointer(
+    pointerId: number,
+    phase: 'down' | 'move' | 'up' | 'cancel',
+    logicalX: number,
+    logicalY: number,
+  ): void {
+    this.touchSensed = true;
+    this.isTouchPointer = true;
+    this.usingGamepad = false;
+    this.lastInputKind = 'touch';
+    const inBounds =
+      logicalX >= 0 && logicalX <= LOGICAL_WIDTH && logicalY >= 0 && logicalY <= LOGICAL_HEIGHT;
+    this.handleMenuTouchPhase(pointerId, phase, logicalX, logicalY, inBounds);
+  }
+
+  /** Test/debug helper to inject gameplay touch events directly into TouchController. */
+  injectTouchGameplayPointer(
+    pointerId: number,
+    phase: 'down' | 'move' | 'up' | 'cancel',
+    logicalX: number,
+    logicalY: number,
+    portrait: boolean,
+  ): boolean {
+    this.touchSensed = true;
+    this.isTouchPointer = true;
+    this.usingGamepad = false;
+    this.lastInputKind = 'touch';
+    if (phase === 'down') return this.touchController.onPointerDown(pointerId, logicalX, logicalY, portrait);
+    if (phase === 'move') return this.touchController.onPointerMove(pointerId, logicalX, logicalY, portrait);
+    if (phase === 'cancel') return this.touchController.onPointerCancel(pointerId);
+    return this.touchController.onPointerUp(pointerId);
   }
 
   private getEffectiveViewportTransform(canvasRect: ClientRectLike): ViewportTransform {
@@ -303,19 +475,99 @@ export class InputManager {
       viewH: lb.h,
       tateRotate: false,
       boardZoom: false,
+      logicalWidth: LOGICAL_WIDTH,
+      logicalHeight: LOGICAL_HEIGHT,
     };
   }
 
-  private updateMouseFromPointerEvent(e: PointerEvent): void {
-    if (!this.canvas) return;
+  private mapPointerEvent(e: PointerEvent): { x: number; y: number; inBounds: boolean } {
+    if (!this.canvas) {
+      return { x: this.mouseX, y: this.mouseY, inBounds: false };
+    }
     const rect = this.canvas.getBoundingClientRect();
     const transform = this.getEffectiveViewportTransform(rect);
-    const mapped = mapClientToLogical(e.clientX, e.clientY, rect, transform);
-    this.mouseX = mapped.x;
-    this.mouseY = mapped.y;
-    this.mouseInBounds = mapped.inBounds;
-    this.mouseMoved = true;
-    this.usingGamepad = false;
+    return mapClientToLogical(e.clientX, e.clientY, rect, transform);
+  }
+
+  private handleMenuTouchPhase(
+    pointerId: number,
+    phase: 'down' | 'move' | 'up' | 'cancel',
+    x: number,
+    y: number,
+    inBounds: boolean,
+  ): void {
+    if (phase === 'down') {
+      if (this.menuTouchPointerId !== null) return;
+      this.menuTouchPointerId = pointerId;
+      this.menuTouchStartX = x;
+      this.menuTouchStartY = y;
+      this.menuTouchLastY = y;
+      this.menuTouchDraggingScroll = false;
+      this.menuTouchDraggingHorizontal = false;
+      this.menuTouchInBounds = inBounds;
+      this.mouseX = x;
+      this.mouseY = y;
+      this.mouseInBounds = inBounds;
+      this.mouseDown = true;
+      this.mouseMoved = true;
+      return;
+    }
+
+    if (pointerId !== this.menuTouchPointerId) return;
+
+    if (phase === 'move') {
+      this.mouseX = x;
+      this.mouseY = y;
+      this.mouseInBounds = inBounds;
+      this.mouseMoved = true;
+
+      const totalDx = x - this.menuTouchStartX;
+      const totalDy = y - this.menuTouchStartY;
+
+      if (!this.menuTouchDraggingScroll && !this.menuTouchDraggingHorizontal) {
+        if (Math.abs(totalDy) >= TOUCH_MENU_SCROLL_THRESHOLD_PX && Math.abs(totalDy) > Math.abs(totalDx) * 1.15) {
+          this.menuTouchDraggingScroll = true;
+          this.mouseDown = false; // Yield slider drag once vertical swipe is committed
+          this.scrollDelta += -(y - this.menuTouchStartY);
+          this.menuTouchLastY = y;
+          return;
+        }
+        if (Math.abs(totalDx) >= TOUCH_MENU_SCROLL_THRESHOLD_PX && Math.abs(totalDx) > Math.abs(totalDy) * 1.2) {
+          this.menuTouchDraggingHorizontal = true;
+        }
+      }
+
+      if (this.menuTouchDraggingScroll) {
+        this.scrollDelta += -(y - this.menuTouchLastY);
+        this.menuTouchLastY = y;
+      }
+      return;
+    }
+
+    if (phase === 'up') {
+      this.mouseX = x;
+      this.mouseY = y;
+      this.mouseInBounds = inBounds;
+      const totalDist = Math.hypot(x - this.menuTouchStartX, y - this.menuTouchStartY);
+      const shouldClick =
+        !this.menuTouchDraggingScroll &&
+        !this.menuTouchDraggingHorizontal &&
+        totalDist < TOUCH_MENU_SCROLL_THRESHOLD_PX &&
+        (inBounds || this.menuTouchInBounds) &&
+        !this.captureCallback;
+
+      this.mouseDown = false;
+      this.menuTouchPointerId = null;
+      this.menuTouchDraggingScroll = false;
+      this.menuTouchDraggingHorizontal = false;
+      if (shouldClick) {
+        this.mouseClicked = true;
+      }
+      return;
+    }
+
+    // cancel
+    this.resetMenuTouchGesture();
   }
 
   private readonly onKeyDown = (e: KeyboardEvent): void => {
@@ -341,6 +593,8 @@ export class InputManager {
     }
     this.heldKeys.add(e.code);
     this.usingGamepad = false;
+    this.touchSensed = false;
+    this.lastInputKind = 'keyboard';
   };
 
   private readonly onKeyUp = (e: KeyboardEvent): void => {
@@ -353,15 +607,95 @@ export class InputManager {
     this.simPressedKeys.clear();
     this.mouseDown = false;
     this.mouseClicked = false;
+    this.scrollDelta = 0;
+    this.touchController.reset(this.gameplayPortrait);
+    this.resetMenuTouchGesture();
+    this.resetRepeatTimers();
+  };
+
+  private readonly onWheel = (e: WheelEvent): void => {
+    if (this.gameplayActive) return;
+    e.preventDefault();
+    // Normalize wheel delta into roughly pixel-equivalent scroll steps
+    const step = Math.sign(e.deltaY) * Math.min(48, Math.max(12, Math.abs(e.deltaY) * 0.4));
+    this.scrollDelta += step;
   };
 
   private readonly onPointerMove = (e: PointerEvent): void => {
-    this.updateMouseFromPointerEvent(e);
+    const mapped = this.mapPointerEvent(e);
+    if (e.pointerType === 'touch') {
+      this.touchSensed = true;
+      this.isTouchPointer = true;
+      this.usingGamepad = false;
+      this.lastInputKind = 'touch';
+      if (this.gameplayActive && this.touchControlsAllowed) {
+        this.touchController.onPointerMove(e.pointerId, mapped.x, mapped.y, this.gameplayPortrait);
+        return;
+      }
+      this.handleMenuTouchPhase(e.pointerId, 'move', mapped.x, mapped.y, mapped.inBounds);
+      return;
+    }
+
+    if (this.gameplayActive && this.touchController.hasActivePointers()) {
+      this.touchController.onPointerMove(e.pointerId, mapped.x, mapped.y, this.gameplayPortrait);
+    }
+
+    this.mouseX = mapped.x;
+    this.mouseY = mapped.y;
+    this.mouseInBounds = mapped.inBounds;
+    this.mouseMoved = true;
+    this.isTouchPointer = false;
+    this.usingGamepad = false;
+    this.lastInputKind = 'mouse';
   };
 
   private readonly onPointerDown = (e: PointerEvent): void => {
+    const mapped = this.mapPointerEvent(e);
+
+    if (e.pointerType === 'touch') {
+      this.touchSensed = true;
+      this.isTouchPointer = true;
+      this.usingGamepad = false;
+      this.lastInputKind = 'touch';
+      this.onAudioUnlockCallback?.();
+
+      if (this.gameplayActive && this.touchControlsAllowed) {
+        try {
+          this.canvas?.setPointerCapture(e.pointerId);
+        } catch {
+          // Pointer capture optional
+        }
+        this.touchController.onPointerDown(e.pointerId, mapped.x, mapped.y, this.gameplayPortrait);
+        return;
+      }
+
+      this.handleMenuTouchPhase(e.pointerId, 'down', mapped.x, mapped.y, mapped.inBounds);
+      return;
+    }
+
     if (e.button !== 0) return;
-    this.updateMouseFromPointerEvent(e);
+
+    this.mouseX = mapped.x;
+    this.mouseY = mapped.y;
+    this.mouseInBounds = mapped.inBounds;
+    this.mouseMoved = true;
+    this.isTouchPointer = false;
+    this.usingGamepad = false;
+    this.lastInputKind = 'mouse';
+
+    // Allow desktop mouse clicks on the on-screen Pause button (or forced Touch Controls: ON)
+    if (this.gameplayActive && this.touchControlsAllowed) {
+      const captured = this.touchController.onPointerDown(
+        e.pointerId,
+        mapped.x,
+        mapped.y,
+        this.gameplayPortrait,
+      );
+      if (captured) {
+        return;
+      }
+    }
+
     this.mouseDown = true;
     if (this.mouseInBounds && !this.captureCallback) {
       this.mouseClicked = true;
@@ -369,46 +703,80 @@ export class InputManager {
   };
 
   private readonly onPointerUp = (e: PointerEvent): void => {
+    if (e.pointerType === 'touch') {
+      if (this.touchController.onPointerUp(e.pointerId)) {
+        return;
+      }
+      const mapped = this.mapPointerEvent(e);
+      this.handleMenuTouchPhase(e.pointerId, 'up', mapped.x, mapped.y, mapped.inBounds);
+      return;
+    }
+
     if (e.button !== 0) return;
+    this.touchController.onPointerUp(e.pointerId);
     this.mouseDown = false;
   };
 
-  private readGamepadState(): void {
-    this.heldGpButtons.clear();
+  private readonly onPointerCancel = (e: PointerEvent): void => {
+    this.touchController.onPointerCancel(e.pointerId);
+    if (e.pointerType === 'touch') {
+      this.handleMenuTouchPhase(e.pointerId, 'cancel', this.mouseX, this.mouseY, false);
+    } else {
+      this.mouseDown = false;
+    }
+  };
+
+  private readNativeGamepads(): readonly (GamepadSnapshot | null)[] {
     if (typeof navigator === 'undefined' || typeof navigator.getGamepads !== 'function') {
-      return;
+      return [];
     }
-    const pads = navigator.getGamepads();
-    if (!pads) return;
+    try {
+      const pads = navigator.getGamepads();
+      if (!pads) return [];
+      return Array.from(pads) as readonly (GamepadSnapshot | null)[];
+    } catch {
+      return [];
+    }
+  }
 
-    for (let p = 0; p < pads.length; p++) {
-      const pad = pads[p];
-      if (!pad || !pad.connected) continue;
+  private readGamepadState(overridePads?: readonly (GamepadSnapshot | null)[]): void {
+    const pads = overridePads ?? this.readNativeGamepads();
+    const res = this.gamepadAdapter.poll(pads);
+    this.lastGamepadPoll = res;
 
-      for (let b = 0; b < pad.buttons.length; b++) {
-        const btn = pad.buttons[b];
-        if (btn && (btn.pressed || btn.value > 0.5)) {
-          this.heldGpButtons.add(b);
-        }
+    this.heldUiGpButtons.clear();
+    this.heldSimGpButtons.clear();
+    for (const b of res.uiButtons) {
+      this.heldUiGpButtons.add(b);
+    }
+    for (const b of res.simButtons) {
+      this.heldSimGpButtons.add(b);
+    }
+
+    if (res.rightStickSpinLeft) this.gpRightStickSpinLeft = true;
+    if (res.rightStickSpinRight) this.gpRightStickSpinRight = true;
+
+    let newlyPressed = false;
+    for (const b of this.heldUiGpButtons) {
+      if (!this.prevUiGpButtons.has(b)) {
+        newlyPressed = true;
+        break;
       }
-
-      // Map left analog stick cleanly onto standard D-pad virtual indices
-      const ax = pad.axes[0] ?? 0;
-      const ay = pad.axes[1] ?? 0;
-      if (ax < -STICK_DEADZONE) this.heldGpButtons.add(GP_DPAD_LEFT);
-      if (ax > STICK_DEADZONE) this.heldGpButtons.add(GP_DPAD_RIGHT);
-      if (ay < -STICK_DEADZONE) this.heldGpButtons.add(GP_DPAD_UP);
-      if (ay > STICK_DEADZONE) this.heldGpButtons.add(GP_DPAD_DOWN);
-      break;
+    }
+    if (newlyPressed) {
+      this.gpAnyNewButtonPressed = true;
+      this.onAudioUnlockCallback?.();
     }
 
-    if (this.heldGpButtons.size > 0) {
+    if (res.anyActiveInput) {
       this.usingGamepad = true;
+      this.touchSensed = false;
+      this.lastInputKind = 'gamepad';
     }
 
     // Check live capture mode for newly pressed gamepad button
     if (this.captureCallback) {
-      for (const btn of this.heldGpButtons) {
+      for (const btn of this.heldUiGpButtons) {
         if (!this.prevUiGpButtons.has(btn)) {
           const cb = this.captureCallback;
           this.captureCallback = null;
@@ -420,6 +788,12 @@ export class InputManager {
     }
   }
 
+  /** Test/debug helper to poll synthetic GamepadSnapshots directly into InputManager. */
+  injectGamepadSnapshots(pads: readonly (GamepadSnapshot | null)[]): GamepadPollResult | null {
+    this.readGamepadState(pads);
+    return this.lastGamepadPoll;
+  }
+
   private anyKeyIn(codes: readonly string[], set: ReadonlySet<string>): boolean {
     for (let i = 0; i < codes.length; i++) {
       if (set.has(codes[i])) return true;
@@ -427,37 +801,78 @@ export class InputManager {
     return false;
   }
 
-  private anyGpHeld(buttons: readonly number[]): boolean {
+  private anyGpHeld(buttons: readonly number[], set: ReadonlySet<number>): boolean {
     for (let i = 0; i < buttons.length; i++) {
-      if (this.heldGpButtons.has(buttons[i])) return true;
+      if (set.has(buttons[i])) return true;
     }
     return false;
   }
 
-  private anyGpEdge(buttons: readonly number[], prevSet: ReadonlySet<number>): boolean {
+  private anyGpEdge(
+    buttons: readonly number[],
+    heldSet: ReadonlySet<number>,
+    prevSet: ReadonlySet<number>,
+  ): boolean {
     for (let i = 0; i < buttons.length; i++) {
       const b = buttons[i];
-      if (this.heldGpButtons.has(b) && !prevSet.has(b)) return true;
+      if (heldSet.has(b) && !prevSet.has(b)) return true;
     }
     return false;
   }
 
-  isActionHeld(verb: ActionVerb, settings?: UserSettings): boolean {
+  isActionHeld(verb: ActionVerb, settings?: UserSettings, forSim = false): boolean {
     const kb = settings?.keyboard[verb] ?? FALLBACK_KB[verb];
     const gp = settings?.gamepad[verb] ?? FALLBACK_GP[verb];
-    return this.anyKeyIn(kb, this.heldKeys) || this.anyGpHeld(gp);
+    const gpSet = forSim ? this.heldSimGpButtons : this.heldUiGpButtons;
+    return this.anyKeyIn(kb, this.heldKeys) || this.anyGpHeld(gp, gpSet);
+  }
+
+  private stepMenuRepeat(dir: RepeatDir, freshEdge: boolean, held: boolean, dtSec: number): boolean {
+    const state = this.repeatTimers[dir];
+    if (freshEdge) {
+      state.held = true;
+      state.elapsed = 0;
+      state.repeating = false;
+      return true;
+    }
+    if (!held) {
+      state.held = false;
+      state.elapsed = 0;
+      state.repeating = false;
+      return false;
+    }
+    if (dtSec <= 0) {
+      return false;
+    }
+    if (!state.held) {
+      state.held = true;
+      state.elapsed = 0;
+      state.repeating = false;
+      return false;
+    }
+    state.elapsed += dtSec;
+    const threshold = state.repeating ? MENU_REPEAT_RATE_SEC : MENU_REPEAT_DELAY_SEC;
+    if (state.elapsed >= threshold) {
+      state.elapsed -= threshold;
+      state.repeating = true;
+      return true;
+    }
+    return false;
   }
 
   /**
    * Edge-triggered UI input polling for menus, settings, palette editor, and pause checks.
+   * Supports smooth menu hold-repeat when `dtSec > 0`.
    */
-  pollUiInput(settings?: UserSettings): UiInputState {
+  pollUiInput(settings?: UserSettings, dtSec = 0): UiInputState {
     this.readGamepadState();
 
     if (this.captureCallback) {
       this.uiPressedKeys.clear();
       this.mouseClicked = false;
       this.mouseMoved = false;
+      this.scrollDelta = 0;
+      this.gpAnyNewButtonPressed = false;
       return {
         up: false,
         down: false,
@@ -478,6 +893,9 @@ export class InputManager {
         mouseClicked: false,
         mouseMoved: false,
         usingGamepad: this.usingGamepad,
+        isTouchPointer: this.isTouchPointer,
+        scrollDelta: 0,
+        anyGamepadPressed: false,
       };
     }
 
@@ -486,22 +904,33 @@ export class InputManager {
       const gpBtns = settings?.gamepad[verb] ?? FALLBACK_GP[verb];
       return (
         this.anyKeyIn(kbCodes, this.uiPressedKeys) ||
-        this.anyGpEdge(gpBtns, this.prevUiGpButtons)
+        this.anyGpEdge(gpBtns, this.heldUiGpButtons, this.prevUiGpButtons)
       );
     };
 
+    const upHeld = this.isActionHeld('up', settings, false);
+    const downHeld = this.isActionHeld('down', settings, false);
+    const leftHeld = this.isActionHeld('left', settings, false);
+    const rightHeld = this.isActionHeld('right', settings, false);
+
+    const up = this.stepMenuRepeat('up', edge('up'), upHeld, dtSec);
+    const down = this.stepMenuRepeat('down', edge('down'), downHeld, dtSec);
+    const left = this.stepMenuRepeat('left', edge('left'), leftHeld, dtSec);
+    const right = this.stepMenuRepeat('right', edge('right'), rightHeld, dtSec);
+    const touchPause = this.touchController.consumePausePressed();
+
     const state: UiInputState = {
-      up: edge('up'),
-      down: edge('down'),
-      left: edge('left'),
-      right: edge('right'),
+      up,
+      down,
+      left,
+      right,
       confirm: edge('confirm'),
       cancel: edge('cancel'),
-      pause: edge('pause'),
-      upHeld: this.isActionHeld('up', settings),
-      downHeld: this.isActionHeld('down', settings),
-      leftHeld: this.isActionHeld('left', settings),
-      rightHeld: this.isActionHeld('right', settings),
+      pause: edge('pause') || touchPause,
+      upHeld,
+      downHeld,
+      leftHeld,
+      rightHeld,
       mousePos: { x: this.mouseX, y: this.mouseY },
       mouseX: this.mouseX,
       mouseY: this.mouseY,
@@ -510,14 +939,19 @@ export class InputManager {
       mouseClicked: this.mouseClicked,
       mouseMoved: this.mouseMoved,
       usingGamepad: this.usingGamepad,
+      isTouchPointer: this.isTouchPointer,
+      scrollDelta: this.scrollDelta,
+      anyGamepadPressed: this.gpAnyNewButtonPressed,
     };
 
     // Consume UI edge latches
     this.uiPressedKeys.clear();
     this.mouseClicked = false;
     this.mouseMoved = false;
+    this.scrollDelta = 0;
+    this.gpAnyNewButtonPressed = false;
     this.prevUiGpButtons.clear();
-    for (const btn of this.heldGpButtons) {
+    for (const btn of this.heldUiGpButtons) {
       this.prevUiGpButtons.add(btn);
     }
 
@@ -525,13 +959,17 @@ export class InputManager {
   }
 
   /**
-   * Produces an exact deterministic InputFrame for one 60 Hz simulation step.
+   * Produces an exact deterministic InputFrame for one 60 Hz simulation step,
+   * merging Keyboard, Xbox/Tesla/W3C Gamepad, and Translucent Touch Stick/Buttons cleanly.
    */
   pollSimInputFrame(settings: UserSettings): InputFrame {
     this.readGamepadState();
 
     if (this.captureCallback) {
       this.simPressedKeys.clear();
+      this.gpRightStickSpinLeft = false;
+      this.gpRightStickSpinRight = false;
+      this.touchController.clearEdges();
       return {
         moveLeft: false,
         moveRight: false,
@@ -551,16 +989,18 @@ export class InputManager {
     const gp = settings.gamepad;
     const edge = (verb: ActionVerb): boolean =>
       this.anyKeyIn(kb[verb] ?? [], this.simPressedKeys) ||
-      this.anyGpEdge(gp[verb] ?? [], this.prevSimGpButtons);
+      this.anyGpEdge(gp[verb] ?? [], this.heldSimGpButtons, this.prevSimGpButtons);
+
+    const touch = this.touchController.consumeSimState();
 
     const frame: InputFrame = {
-      moveLeft: this.isActionHeld('moveLeft', settings),
-      moveRight: this.isActionHeld('moveRight', settings),
-      moveLeftPressed: edge('moveLeft'),
-      moveRightPressed: edge('moveRight'),
-      spinLeftPressed: edge('spinLeft'),
-      spinRightPressed: edge('spinRight'),
-      hardDropPressed: edge('hardDrop'),
+      moveLeft: this.isActionHeld('moveLeft', settings, true) || touch.moveLeft,
+      moveRight: this.isActionHeld('moveRight', settings, true) || touch.moveRight,
+      moveLeftPressed: edge('moveLeft') || touch.moveLeftPressed,
+      moveRightPressed: edge('moveRight') || touch.moveRightPressed,
+      spinLeftPressed: edge('spinLeft') || this.gpRightStickSpinLeft || touch.spinLeftPressed,
+      spinRightPressed: edge('spinRight') || this.gpRightStickSpinRight || touch.spinRightPressed,
+      hardDropPressed: edge('hardDrop') || touch.hardDropPressed,
       usingGamepad: this.usingGamepad,
       moveSpeedIndex: settings.gameplay.moveSpeedIndex,
       kbMoveDelay: settings.gameplay.kbMoveDelay,
@@ -569,8 +1009,10 @@ export class InputManager {
 
     // Consume Sim edge latches
     this.simPressedKeys.clear();
+    this.gpRightStickSpinLeft = false;
+    this.gpRightStickSpinRight = false;
     this.prevSimGpButtons.clear();
-    for (const btn of this.heldGpButtons) {
+    for (const btn of this.heldSimGpButtons) {
       this.prevSimGpButtons.add(btn);
     }
 
@@ -578,44 +1020,32 @@ export class InputManager {
   }
 
   /**
-   * Optional tactile gamepad haptic rumble (safely no-ops when unsupported or disabled).
+   * Tactile gamepad haptic rumble (Xbox/Tesla/PlayStation/Safari) + mobile touch vibration.
    */
   triggerRumble(intensity: number, durationMs: number, enabled = true): void {
     if (!enabled || intensity <= 0 || durationMs <= 0) {
       return;
     }
-    if (typeof navigator === 'undefined' || typeof navigator.getGamepads !== 'function') {
-      return;
-    }
-    try {
-      const pads = navigator.getGamepads();
-      if (!pads) return;
-      const clamped = Math.max(0, Math.min(1, intensity));
-      for (let p = 0; p < pads.length; p++) {
-        const pad = pads[p] as
-          | (Gamepad & {
-              vibrationActuator?: {
-                playEffect?: (
-                  type: string,
-                  params: {
-                    duration: number;
-                    strongMagnitude: number;
-                    weakMagnitude: number;
-                  },
-                ) => Promise<unknown>;
-              };
-            })
-          | null;
-        if (!pad || !pad.connected || !pad.vibrationActuator?.playEffect) continue;
-        void pad.vibrationActuator.playEffect('dual-rumble', {
-          duration: Math.round(durationMs),
-          strongMagnitude: clamped,
-          weakMagnitude: clamped * 0.6,
-        });
-        break;
+
+    const rumbledPad = this.gamepadAdapter.triggerRumble(
+      this.readNativeGamepads(),
+      intensity,
+      durationMs,
+      enabled,
+    );
+
+    if (
+      !rumbledPad &&
+      this.touchSensed &&
+      typeof navigator !== 'undefined' &&
+      typeof navigator.vibrate === 'function'
+    ) {
+      try {
+        const ms = Math.max(8, Math.min(80, Math.round(durationMs * 0.45 * Math.min(1, intensity + 0.35))));
+        navigator.vibrate(ms);
+      } catch {
+        // Ignore mobile vibrate permission errors cleanly
       }
-    } catch {
-      // Ignore browser haptic errors cleanly
     }
   }
 }

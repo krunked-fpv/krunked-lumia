@@ -522,8 +522,24 @@ export class ControlsRemapScreen {
       return;
     }
 
-    // Mouse interactions
+    // Touch swipe & mouse wheel scrolling over the 12-verb list
+    const maxScroll = Math.max(0, REMAPPABLE_VERBS.length - VISIBLE_ROWS);
+    if (uiInput.scrollDelta && Math.abs(uiInput.scrollDelta) >= 8 && maxScroll > 0) {
+      const steps = Math.sign(uiInput.scrollDelta) * Math.max(1, Math.round(Math.abs(uiInput.scrollDelta) / 15));
+      this.scrollTop = Math.max(0, Math.min(maxScroll, this.scrollTop + steps));
+    }
+
+    // Mouse / Touch interactions
     if (uiInput.mouseInBounds) {
+      if (maxScroll > 0 && (uiInput.mouseClicked || uiInput.mouseDown)) {
+        const scrollHit: HitRect = { x: 306, y: 33, w: 12, h: VISIBLE_ROWS * 15 + 4 };
+        if (hitTest(uiInput.mouseX, uiInput.mouseY, scrollHit)) {
+          const frac = Math.max(0, Math.min(1, (uiInput.mouseY - 35) / Math.max(1, VISIBLE_ROWS * 15 - 2)));
+          this.scrollTop = Math.round(frac * maxScroll);
+          return;
+        }
+      }
+
       if (uiInput.mouseClicked) {
         if (hitTest(uiInput.mouseX, uiInput.mouseY, BACK_BTN_RECT)) {
           inputManager.cancelCapture();
@@ -864,12 +880,16 @@ export class ControlsRemapScreen {
         'center',
       );
     } else {
+      const hint =
+        this.activeTab === 'CONTROLLER'
+          ? 'XBOX: A=B0 B=B1 X=B2 Y=B3 LB/LT=B4/6 RB/RT=B5/7 MENU=B9'
+          : 'ENTER / CLICK VERB TO REMAP   SHARED MENU + GAME KEYS ALLOWED';
       renderer.drawTextHex(
-        'ENTER / CLICK VERB TO REMAP   SHARED MENU + GAME KEYS ALLOWED',
+        hint,
         160,
         144,
         palette.colors[2],
-        0.72,
+        0.78,
         '3x5',
         'center',
       );

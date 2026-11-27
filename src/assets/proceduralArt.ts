@@ -446,6 +446,69 @@ const LOCK_FRAMES_10X12: readonly (readonly string[])[] = [
 ];
 
 /**
+ * 4 crisp 11x11 monochrome pixel icons for translucent touch controls & HUD:
+ * [0] Spin CCW, [1] Spin CW, [2] Hard Drop, [3] Pause
+ */
+const TOUCH_ICONS_11X11: readonly (readonly string[])[] = [
+  // 0: Spin CCW — crisp counter-clockwise curved pixel arrow
+  [
+    '....#####..',
+    '..###...##.',
+    '.##......##',
+    '####......#',
+    '###........',
+    '.#...##....',
+    '....####...',
+    '.#...##...#',
+    '.##......##',
+    '..###..###.',
+    '....####...',
+  ],
+  // 1: Spin CW — crisp clockwise curved pixel arrow
+  [
+    '..#####....',
+    '.##...###..',
+    '##......##.',
+    '#......####',
+    '........###',
+    '....##...#.',
+    '...####....',
+    '#...##...#.',
+    '##......##.',
+    '.###..###..',
+    '...####....',
+  ],
+  // 2: Hard Drop — bold downward double chevron + impact bar
+  [
+    '..##...##..',
+    '...##.##...',
+    '....###....',
+    '.....#.....',
+    '.##.....##.',
+    '..##...##..',
+    '...##.##...',
+    '....###....',
+    '.....#.....',
+    '.#########.',
+    '.#########.',
+  ],
+  // 3: Pause — crisp twin vertical bars
+  [
+    '...........',
+    '..##...##..',
+    '..##...##..',
+    '..##...##..',
+    '..##...##..',
+    '..##...##..',
+    '..##...##..',
+    '..##...##..',
+    '..##...##..',
+    '..##...##..',
+    '...........',
+  ],
+];
+
+/**
  * Compute horizontal span [leftX, rightX] of the 68x128 diamond-hexagon container border at row y (0..127).
  * - y = 0: top HUD hairline (x = 0..34) with roof apex at x = 33..34
  * - y = 1..33: 45-degree roof widening from (32, 35) to (0, 67)
@@ -711,6 +774,24 @@ export function generateBuiltinAtlas(): BuiltinAtlasResult {
       originX: 0,
       originY: 0,
       frames: [rect],
+    };
+  }
+
+  // 11b. touch_icons_spr (4 frames, 11x11: Spin CCW, Spin CW, Hard Drop, Pause)
+  {
+    const frames: SpriteFrameRect[] = [];
+    for (let i = 0; i < TOUCH_ICONS_11X11.length; i++) {
+      const rect = packer.alloc(11, 11);
+      canvas.drawPattern(rect.x, rect.y, TOUCH_ICONS_11X11[i]);
+      frames.push(rect);
+    }
+    sprites['touch_icons_spr'] = {
+      name: 'touch_icons_spr',
+      width: 11,
+      height: 11,
+      originX: 5,
+      originY: 5,
+      frames,
     };
   }
 

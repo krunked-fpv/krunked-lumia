@@ -12,7 +12,9 @@ import {
   type GameplaySettings,
   type KeyboardBindings,
   type NextBlockLocation,
+  type PortraitMode,
   type RenderSettings,
+  type TouchControlsMode,
   type UserSettings,
 } from '../contracts/index.js';
 
@@ -38,6 +40,10 @@ export const NEXT_BLOCK_LOCATIONS: readonly NextBlockLocation[] = [
   'lower_right',
 ] as const;
 
+export const PORTRAIT_MODES: readonly PortraitMode[] = ['auto', 'on', 'off'] as const;
+export const TOUCH_CONTROLS_MODES: readonly TouchControlsMode[] = ['auto', 'on', 'off'] as const;
+export const DEFAULT_TOUCH_OPACITY = 0.55;
+
 export function createDefaultRenderSettings(): RenderSettings {
   return {
     targetFps: 120,
@@ -51,6 +57,7 @@ export function createDefaultRenderSettings(): RenderSettings {
     boardColors: true,
     boardZoom: false,
     tateRotate: false,
+    portraitMode: 'auto',
   };
 }
 
@@ -65,6 +72,8 @@ export function createDefaultGameplaySettings(): GameplaySettings {
     gamepadRumble: true,
     tutorialEnabled: true,
     soundtestEnabled: false,
+    touchControlsMode: 'auto',
+    touchOpacity: DEFAULT_TOUCH_OPACITY,
   };
 }
 
@@ -103,9 +112,9 @@ export function createDefaultGamepadBindings(): GamepadBindings {
     moveLeft: [14],
     moveRight: [15],
     hardDrop: [13, 3],
-    spinLeft: [1, 2, 4],
-    spinRight: [0, 5],
-    pause: [9],
+    spinLeft: [1, 2, 4, 6],
+    spinRight: [0, 5, 7],
+    pause: [9, 8],
   };
 }
 
@@ -117,6 +126,7 @@ export function createDefaultUserSettings(): UserSettings {
     audio: createDefaultAudioSettings(),
     keyboard: createDefaultKeyboardBindings(),
     gamepad: createDefaultGamepadBindings(),
+    gamepadCustomized: false,
     packMode: 'builtin',
     photosensitivitySeen: false,
   };

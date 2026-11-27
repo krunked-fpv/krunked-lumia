@@ -15,7 +15,7 @@ export const EN_US_STRINGS: Readonly<Record<string, string>> = {
   'photosensitivity.title': 'PHOTOSENSITIVITY NOTICE',
   'photosensitivity.body':
     'Krunked Lumia features rhythmic flashing lights, bloom pulses, and geometric motion. Flashing and screen effects can be reduced or disabled anytime in Settings.',
-  'photosensitivity.hint': 'PRESS ANY KEY OR CLICK TO CONTINUE',
+  'photosensitivity.hint': 'PRESS ANY KEY, BUTTON, OR TAP TO CONTINUE',
 
   // Title & Main Navigation
   'menu.play': 'PLAY',
@@ -130,6 +130,12 @@ export const EN_US_STRINGS: Readonly<Record<string, string>> = {
   'settings.boardZoom.desc': 'Scale up the playfield closely for high-focus play.',
   'settings.tateRotate': 'TATE MODE (90°)',
   'settings.tateRotate.desc': 'Rotate the viewport 90 degrees for vertical monitor setups.',
+  'settings.portraitMode': 'PORTRAIT MODE',
+  'settings.portraitMode.desc': 'Auto-senses vertical phone screens for crisp 9:16 portrait gameplay.',
+  'settings.touchControlsMode': 'TOUCH CONTROLS',
+  'settings.touchControlsMode.desc': 'Translucent pixel virtual stick & buttons (AUTO reveals on touch).',
+  'settings.touchOpacity': 'TOUCH OPACITY',
+  'settings.touchOpacity.desc': 'Translucency of the on-screen pixel stick and spin/drop buttons.',
 
   // Gameplay Settings
   'settings.dropPreviewOpacity': 'DROP PREVIEW',

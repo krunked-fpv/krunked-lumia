@@ -863,6 +863,16 @@ export class ColorEditorScreen {
 
     const total = this.palettes.length;
     const maxVisible = 8;
+    const maxScroll = Math.max(0, total - maxVisible);
+
+    // Touch swipe & mouse wheel scrolling
+    if (input.scrollDelta && Math.abs(input.scrollDelta) >= 8 && maxScroll > 0) {
+      const steps = Math.sign(input.scrollDelta) * Math.max(1, Math.round(Math.abs(input.scrollDelta) / 16));
+      this.listScrollTop = clamp(this.listScrollTop + steps, 0, maxScroll);
+      if (this.listIdx >= 0) {
+        this.listIdx = clamp(this.listIdx, this.listScrollTop, Math.min(total - 1, this.listScrollTop + maxVisible - 1));
+      }
+    }
 
     if (input.up) {
       if (this.listIdx > -2) {
@@ -918,6 +928,16 @@ export class ColorEditorScreen {
         }
       }
 
+      // Draggable/tappable scrollbar track & top/bottom nudge zones (x = 216..223, y = 36..162)
+      if (maxScroll > 0 && (input.mouseClicked || input.mouseDown)) {
+        const trackRect: HitRect = { x: 214, y: 34, w: 10, h: 132 };
+        if (hitTest(input.mouseX, input.mouseY, trackRect)) {
+          const frac = clamp((input.mouseY - 36) / 126, 0, 1);
+          this.listScrollTop = Math.round(frac * maxScroll);
+          return;
+        }
+      }
+
       const visibleEnd = Math.min(total, this.listScrollTop + maxVisible);
       for (let i = this.listScrollTop; i < visibleEnd; i++) {
         const slot = i - this.listScrollTop;
@@ -966,6 +986,12 @@ export class ColorEditorScreen {
     const templates = this.getTemplatePalettes();
     const total = templates.length;
     const maxVisible = 8;
+    const maxScroll = Math.max(0, total - maxVisible);
+
+    if (input.scrollDelta && Math.abs(input.scrollDelta) >= 8 && maxScroll > 0) {
+      const steps = Math.sign(input.scrollDelta) * Math.max(1, Math.round(Math.abs(input.scrollDelta) / 16));
+      this.templateScrollTop = clamp(this.templateScrollTop + steps, 0, maxScroll);
+    }
 
     if (input.up) {
       this.templateIdx = (this.templateIdx - 1 + total) % total;
@@ -1020,11 +1046,25 @@ export class ColorEditorScreen {
       return;
     }
 
-    // Active mouse slider drag takes priority so scrubbing is buttery smooth
+    // Active mouse/touch slider drag takes priority so scrubbing is buttery smooth
     if (this.draggingSlider !== null && input.mouseDown && input.mouseInBounds) {
       const ratio = clamp((input.mouseX - 34) / 150, 0, 1);
       this.applySliderRatio(this.draggingSlider, ratio);
       return;
+    }
+
+    // Touch grab immediately starts dragging if finger lands on one of the 3 sliders
+    if (input.isTouchPointer && input.mouseDown && input.mouseInBounds && this.draggingSlider === null) {
+      for (let i = 0; i < 3; i++) {
+        const trackHit: HitRect = { x: 24, y: 74 + i * 17, w: 170, h: 15 };
+        if (hitTest(input.mouseX, input.mouseY, trackHit)) {
+          this.editZoneIdx = 3 + i;
+          this.draggingSlider = i;
+          const ratio = clamp((input.mouseX - 34) / 150, 0, 1);
+          this.applySliderRatio(i, ratio);
+          return;
+        }
+      }
     }
 
     // Mouse interactions across all EDIT zones

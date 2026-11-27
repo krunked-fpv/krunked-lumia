@@ -15,6 +15,8 @@ export const CUSTOM_PACK_DB_NAME = 'krunked_lumia_packs_v1';
 
 export const LOGICAL_WIDTH = 320;
 export const LOGICAL_HEIGHT = 180;
+export const PORTRAIT_LOGICAL_WIDTH = 180;
+export const PORTRAIT_LOGICAL_HEIGHT = 320;
 
 export const CONTAINER_WIDTH = 68;
 export const CONTAINER_HEIGHT = 128;
@@ -648,6 +650,9 @@ export type NextBlockLocation =
   | 'lower_right';
 
 export type PackMode = 'builtin' | 'custom';
+export type PortraitMode = 'auto' | 'on' | 'off';
+export type TouchControlsMode = 'auto' | 'on' | 'off';
+export type ControllerKind = 'xbox' | 'tesla' | 'playstation' | 'nintendo' | 'generic';
 
 export type ActionVerb =
   | 'up'
@@ -678,6 +683,7 @@ export interface RenderSettings {
   boardColors: boolean;
   boardZoom: boolean;
   tateRotate: boolean;
+  portraitMode?: PortraitMode;
 }
 
 export interface GameplaySettings {
@@ -690,6 +696,8 @@ export interface GameplaySettings {
   gamepadRumble: boolean;
   tutorialEnabled: boolean;
   soundtestEnabled: boolean;
+  touchControlsMode?: TouchControlsMode;
+  touchOpacity?: number; // 0.25..0.95
 }
 
 export interface AudioSettings {
@@ -704,6 +712,7 @@ export interface UserSettings {
   audio: AudioSettings;
   keyboard: KeyboardBindings;
   gamepad: GamepadBindings;
+  gamepadCustomized?: boolean;
   packMode: PackMode;
   photosensitivitySeen: boolean;
 }
@@ -837,6 +846,10 @@ export interface DebugBridge {
     soundtest: SoundtestTelemetry | null;
     settings: UserSettings;
     profile: PlayerProfile;
+    isPortraitGameplay: boolean;
+    touchControlsVisible: boolean;
+    controllerKind: ControllerKind | null;
+    connectedGamepads: number;
   };
   setScreen: (screen: AppScreen) => void;
   startGame: (mode: GameModeId, trackId?: TrackId, seed?: number) => void;

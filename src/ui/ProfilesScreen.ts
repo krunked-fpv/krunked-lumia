@@ -434,9 +434,24 @@ export class ProfilesScreen {
     }
 
     const totalRows = this.profiles.length + 1; // profiles + NEW PLAYER row
+    const maxScroll = Math.max(0, totalRows - VISIBLE_LIST_ROWS);
 
-    // Mouse interactions
+    if (uiInput.scrollDelta && Math.abs(uiInput.scrollDelta) >= 8 && maxScroll > 0) {
+      const steps = Math.sign(uiInput.scrollDelta) * Math.max(1, Math.round(Math.abs(uiInput.scrollDelta) / 20));
+      this.scrollTop = Math.max(0, Math.min(maxScroll, this.scrollTop + steps));
+    }
+
+    // Mouse / Touch interactions
     if (uiInput.mouseInBounds) {
+      if (maxScroll > 0 && (uiInput.mouseClicked || uiInput.mouseDown)) {
+        const scrollHit: HitRect = { x: 164, y: 24, w: 12, h: VISIBLE_LIST_ROWS * 20 };
+        if (hitTest(uiInput.mouseX, uiInput.mouseY, scrollHit)) {
+          const frac = Math.max(0, Math.min(1, (uiInput.mouseY - 26) / Math.max(1, VISIBLE_LIST_ROWS * 20 - 4)));
+          this.scrollTop = Math.round(frac * maxScroll);
+          return;
+        }
+      }
+
       if (uiInput.mouseClicked && hitTest(uiInput.mouseX, uiInput.mouseY, BACK_BTN_RECT)) {
         this.detachTextKeyListener();
         callbacks.onPlayMenuBack?.();
